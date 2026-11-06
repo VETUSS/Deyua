@@ -273,7 +273,16 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
     var section by remember { mutableIntStateOf(0) }   // 0=胶片 1=相纸
     var thumbReq by remember { mutableIntStateOf(0) }  // 缩略图渲染请求版本号，用于取消过期的缩略图渲染
 
+    // [r33] previewBase 是引擎冲洗出来的原图，preview 是套过 Layer 2 之后真正显示的那张。
+    //
+    // 拆成两个状态不是为了整洁，是因为调色**不需要重新冲洗**：拖一下色温就重冲一遍负片
+    // （几百毫秒到几秒）的话，这一整页滑杆就全是死的。有了 previewBase，调色只是拿它
+    // 再跑一遍 Layer 2（十几毫秒），这才是实时。
+    var previewBase by remember { mutableStateOf<Bitmap?>(null) }
     var preview by remember { mutableStateOf<Bitmap?>(null) }
+    // Layer 2 参数，以及曲线背后那张直方图（从**调色之后**的图算，所以它反映的是输出）
+    var tone by remember { mutableStateOf(Layer2.Cfg()) }
+    var toneHist by remember { mutableStateOf<Layer2.Hist?>(null) }
     var photoBmp by remember { mutableStateOf<Bitmap?>(null) }
     var photoData by remember { mutableStateOf<Triple<FloatArray, Int, Int>?>(null) }
     var thumbSrc by remember { mutableStateOf<Triple<FloatArray, Int, Int>?>(null) } // 缩略图专用小尺寸源（长边 ThumbStore.SRC_EDGE），避免每次拿全尺寸 float 渲染
@@ -630,6 +639,8 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         // [r19] 色彩模式也要进配方：否则存的时候是「原色」，应用回来变成「校色」，
         // 同一份配方两次出片颜色不一样（这就是"配方不完整"的那类隐蔽 bug）。
         o.put("trueColor", filmTrueColor)
+        // [r33] 调色当然是配方的一部分：曲线、色温、暗角都在这里
+        o.put("tone", tone.toJson())
         return o.toString()
     }
 
@@ -688,6 +699,9 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         dateInsetY = o.optDouble("dateInsetY", dateInsetY.toDouble()).toFloat()
         scanFilm = o.optBoolean("scanFilm", scanFilm)
         filmTrueColor = o.optBoolean("trueColor", filmTrueColor)
+        // 旧配方没有这个键：fromJson(null) 给出默认值，也就是"不带调色"。
+        // 这里刻意覆盖而不是保留当前值 —— 配方是一份完整快照，应用它就该回到那个状态。
+        tone = Layer2.Cfg.fromJson(o.optJSONObject("tone"))
 
         // 新配方不继承"分级自救"留下的临时省略状态
         forceNoOverscan = false; forceNoEdgeText = false
@@ -716,6 +730,9 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         overscanEdgeText = true; overscanFNumber = 0f; overscanFrameNumber = 0
         dateBack = DateBackCfg(); dateInsetX = 3f; dateInsetY = 2.4f
         scanFilm = false; filmTrueColor = false
+        // [r33] 调色也一起复位 —— 「重置」是"回到出厂"，留着一套曲线和暗角在画面里，
+        // 用户会以为重置坏了（r30 那次已经踩过一次同类问题）。
+        tone = Layer2.Cfg()
         colorHintMute[0] = true
         forceNoOverscan = false; forceNoEdgeText = false
         animScope.launch { scaleAnim.snapTo(1f); panAnim.snapTo(Offset.Zero) }
@@ -1099,7 +1116,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                     val s = e.open(testPx, 960, 720, 3, "{\"preview_long_edge\":1280}")
                     session = s
                     val b = doRender(e, s, "init")
-                    preview = b
+                    previewBase = b
                     // [r9] 没导入照片时，网格里也先给出「每种胶片/相纸 × 内置测试图」的缩略图 ——
                     // 256 px 一套只要几百毫秒，而且写在磁盘缓存里（key=builtin-test），
                     // 之后每次冷启动直接命中。否则用户先看到的是 26 个空格子，会以为缩略图坏了。
@@ -1175,7 +1192,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                     val b = renderWithHeal(eng, s, "import")
                     // 失败时保留上一帧，不要把画面清空成转圈（转圈会让人以为整个 App 挂了）
                     if (b != null) {
-                        preview = b
+                        previewBase = b
                         // [r25] 色相诊断：把「原图」与「冲洗后」的平均色相并排打出来。
                         // 用户反馈"绿叶冲洗后变黄绿"时，这一行能直接回答是引擎把绿推向了黄
                         // （Δ 很大），还是胶片本身就该这样（Δ 在 10° 以内，属负片对叶绿素的
@@ -1247,7 +1264,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                 // 卡死不再"打到死"：分级自救会逐级剥参数重试，直到能出图，
                 // 并且把"哪一级开始能出图"写进日志（这就是二分定位）。
                 val b = renderWithHeal(eng, session, "change")
-                if (b != null) preview = b
+                if (b != null) previewBase = b
                 // 主渲染完成后补渲被让位中断的缩略图
                 thumbSrc?.let { ts -> renderMissingThumbs(engine ?: eng, ts, thumbPhotoKey, section, filmVariant, printVariant) }
             }
@@ -1282,6 +1299,30 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
             delay(4500)
             if (status == s) status = null
         }
+    }
+
+    // ===== [r33] Layer 2：引擎出图 → 调色 → 显示 =====
+    //
+    // 这一段是整页「影调」的引擎：只要 previewBase 或参数变了，就重跑一遍。
+    //
+    // delay(16) 是必要的，不是凑数 —— 拖滑杆时 onValueChange 每帧都在改 tone，
+    // 没有这个下限，每次改都会起一轮全图处理，几轮叠在一起反而更卡（它们互相抢 CPU）。
+    // 16 ms 刚好一帧：用户看到的是「跟手」，而不是「一卡一卡地追手」。
+    LaunchedEffect(previewBase, tone) {
+        val base = previewBase
+        if (base == null) { preview = null; toneHist = null; return@LaunchedEffect }
+        delay(16)
+        if (tone.isIdentity) {
+            preview = base
+            toneHist = withContext(Dispatchers.Default) { Layer2.histogram(base) }
+            return@LaunchedEffect
+        }
+        val r = withContext(Dispatchers.Default) {
+            val b = Layer2.apply(base, tone)
+            b to Layer2.histogram(b)
+        }
+        preview = r.first
+        toneHist = r.second
     }
 
     // 预览 HDR：开关开启时把预览叠加高光恢复（与导出 gain map 同一曲线），后台计算避免卡顿
@@ -1555,9 +1596,14 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
 
                 // 收起状态只留片名/工具/导出：内容不参与布局，也不会在窄高度里溢出
                 if (!collapsed) {
-                // 一级切换：胶片 / 调校
+                // 一级切换：胶片 / 影调 / 调校
+                //
+                // [r33] 「影调」插在中间，而不是并进「调校」：调校页改的是**冲洗本身**
+                // （重冲负片、重印相纸，一次几百毫秒到几秒），影调页改的是**扫描之后
+                // 的照片**（十几毫秒，实时）。两种手感混在一页里，用户没法判断
+                // "我这一下动了什么、为什么要等"。
                 UnderlineTabs(
-                    labels = listOf("胶片", "调校"), index = tab,
+                    labels = listOf("胶片", "影调", "调校"), index = tab,
                     onSelect = { tab = it }, reduceMotion = reduceMotion,
                     modifier = Modifier.padding(horizontal = 10.dp),
                 )
@@ -1577,7 +1623,23 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                             filmTrueColor = filmTrueColor, onFilmTrueColor = { filmTrueColor = it },
                             reduceMotion = reduceMotion,
                         )
-                        1 -> FormatTab(
+                        1 -> ToneTab(
+                            cfg = tone,
+                            hist = toneHist,
+                            onChange = { tone = it },
+                            // 松手时打一行：调色不进引擎，所以"没反应"只可能是 Layer 2
+                            // 自己出问题。这一行把当时的参数原样记下来，日志能复现。
+                            onCommit = {
+                                if (!tone.isIdentity) {
+                                    Diagnostics.log("tone", "Layer2 ${previewBase?.width}x${previewBase?.height} " +
+                                        "色温=${"%.0f".format(tone.temp)} 色调=${"%.0f".format(tone.tint)} " +
+                                        "曝光=${"%.2f".format(tone.exposure)} 对比=${"%.0f".format(tone.contrast)} " +
+                                        "饱和=${"%.0f".format(tone.saturation)} 暗角=${"%.0f".format(tone.vignette)}")
+                                }
+                            },
+                            reduceMotion = reduceMotion,
+                        )
+                        2 -> FormatTab(
                             formatIdx = formatIdx, onFormat = { formatIdx = it; renderTick++ },
                             antihalationRemoved = antihalationRemoved, onAntihalation = { antihalationRemoved = it; renderTick++ },
                             halation = halationAmount, onHalationChange = { halationAmount = it }, onHalationCommit = { renderTick++ },
@@ -1941,14 +2003,27 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                         Diagnostics.log("export", "开始导出 fmt=${fmt.label} color=$renderColor size=$sizeL q=$q dest=$saveDest stem=$stem")
                                         // [r5] 导出原来在裸线程里直接用主会话渲染，与预览渲染并发跑在
                                         // 同一个 VkDevice 上（GPU 挂起的一个来源）。收进闸门串行执行。
-                                        val full = withEngineGate(60000L, "export full") {
+                                        val fullRaw = withEngineGate(60000L, "export full") {
                                             eng.setParams(sess, "{\"output_color_space\":\"$renderColor\",\"output_cctf_encoding\":true}")
                                             setStep(1, true, false); setStep(2, false, true)
                                             eng.renderToBitmap(sess, "full")
                                         }
-                                        if (full == null) { Diagnostics.log("export", "full 渲染失败 ${eng.lastError()}"); exportOk = false; status = "导出失败：全尺寸渲染失败"; onDone(); return@Thread }
+                                        if (fullRaw == null) { Diagnostics.log("export", "full 渲染失败 ${eng.lastError()}"); exportOk = false; status = "导出失败：全尺寸渲染失败"; onDone(); return@Thread }
                                         setStep(2, true, false); setStep(3, false, true)
-                                        Diagnostics.log("export", "full 渲染 ${full.width}x${full.height}")
+                                        Diagnostics.log("export", "full 渲染 ${fullRaw.width}x${fullRaw.height}")
+                                        // [r33] 调色必须在 HDR 封装**之前**，而且必须作用在 full 本身
+                                        // 而不是放在最后对成品再套一遍：
+                                        //  · gain map 是相对 SDR 主图算的，主图先调色、增益图后生成，
+                                        //    两者的色温和曲线才一致；反过来做，高光会和主图对不上；
+                                        //  · EXIF 里的尺寸与指纹都取自 full，晚套一层就全错位了。
+                                        // 用的是和预览完全相同的 Layer2.apply —— 预览看到什么就导出什么。
+                                        val full = if (tone.isIdentity) fullRaw else Layer2.apply(fullRaw, tone)
+                                        if (!tone.isIdentity) {
+                                            Diagnostics.log("export", "Layer2 已应用 ${full.width}x${full.height} " +
+                                                "色温=${"%.0f".format(tone.temp)} 对比=${"%.0f".format(tone.contrast)} " +
+                                                "曲线=${if (tone.curveRgb != Layer2.LINEAR) "已改" else "线性"} " +
+                                                "暗角=${"%.0f".format(tone.vignette)}")
+                                        }
                                         var out = full
                                         // [r27] 配方文本抽成一个带尺寸入参的小函数：HDR JPEG 要在
                                         // 缩放之前就把 EXIF 算好（它走预编码字节，绕过了后面那条
@@ -1963,6 +2038,20 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                             append("\n光晕: ${"%.2f".format(halationAmount)}×")
                                             append("\n移除防光晕层: ${if (antihalationRemoved) "是" else "否"}")
                                             append("\n色彩: $renderColor")
+                                            // [r33] 调色摘要：一张看起来"和预览不一样"的成片，第一个
+                                            // 要回答的问题就是"到底调了什么"。全零时不写这一行。
+                                            if (!tone.isIdentity) {
+                                                append("\n调色: 色温 ${"%.0f".format(tone.temp)}" +
+                                                    " · 色调 ${"%.0f".format(tone.tint)}" +
+                                                    " · 曝光 ${"%.2f".format(tone.exposure)} EV" +
+                                                    " · 对比 ${"%.0f".format(tone.contrast)}" +
+                                                    " · 饱和 ${"%.0f".format(tone.saturation)}")
+                                                if (tone.curveRgb != Layer2.LINEAR || tone.curveR != Layer2.LINEAR ||
+                                                    tone.curveG != Layer2.LINEAR || tone.curveB != Layer2.LINEAR)
+                                                    append(" · 曲线已调")
+                                                if (tone.vignette != 0f)
+                                                    append(" · 暗角 ${"%.0f".format(tone.vignette)}")
+                                            }
                                             append("\n尺寸: ${mw}×${mh}")
                                             append("\n冲洗于: $nowS")
                                         }
@@ -2010,6 +2099,14 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                                 }
                                             } else {
                                                 Diagnostics.log("export", "HDR 单帧：输入不是 RAW，没有超出纸白的余量可读")
+                                            }
+                                            // [r33] 高光帧也要过同一套调色。它是同一张负片、同一台
+                                            // 放大机印的，只是曝光多三档 —— 扫描之后的调色当然要一致。
+                                            // 只调主图会让 gain map 带着未调色的色偏，HDR 一亮起来就偏色。
+                                            if (hdrFrame != null && !tone.isIdentity) {
+                                                val tinted = Layer2.apply(hdrFrame!!, tone)
+                                                if (tinted !== hdrFrame) { hdrFrame!!.recycle(); hdrFrame = tinted }
+                                                Diagnostics.log("export", "HDR 高光帧已同步调色")
                                             }
                                             runCatching {
                                                 val exif1 = Exporter.exifApp1(ctx, full,
