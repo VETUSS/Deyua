@@ -580,7 +580,7 @@ fun FormatTab(
                 note = "暗房遮挡与加光 · 改印相曝光，不改像素",
             )
             if (darkroom.cmActive) {
-                Text("开关只是许可：两个档数都为 0 时，画面与关掉完全一样",
+                Text("开关只是许可：0 档即原样。打开时会先把高光侧置 2 档，可直接归零",
                     color = Dv.label3, fontSize = 9.5f.sp, lineHeight = 13.sp,
                     modifier = Modifier.padding(top = 2.dp))
                 ParamBlock("高光侧", "%.1f 档".format(darkroom.cmHighlights), note = "多曝 · 压住高光") {

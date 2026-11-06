@@ -26,6 +26,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -91,6 +92,16 @@ fun TickerSlider(
     val start = valueRange.start
     val span = valueRange.endInclusive - start
 
+    // [r36] 手势块只在 valueRange / snapStep 变化时重启，所以闭包里那份
+    // onValueChange 是**第一次组合**时的那一个 —— 而调用点的 lambda 又往往
+    // 捕获了一份参数快照（「暗房」整组共用一个 DarkroomCfg）。后果：拖 A 杆
+    // 送出去的是 `cfg.copy(A = …)`，里面的 B、C、D 还是打开面板那一刻的值，
+    // 于是 B 自己跳回去。用户看到的就是「调阴影侧，高光侧跳回 2.0」。
+    // 和 r33 的曲线手势同一个坑：手势块必须读最新回调，不能靠闭包。
+    // 名称避开手势块里的 `change`（那是 PointerInputChange）
+    val emit = rememberUpdatedState(onValueChange)
+    val finish = rememberUpdatedState(onValueChangeFinished)
+
     // 当前吸附档位索引；山丘高度直接由 value 推导（纯跟手，无动画重置）
     val currentIdx = ((value - start) / snapStep).roundToInt()
 
@@ -145,8 +156,8 @@ fun TickerSlider(
                         lastTick = idxOf(start + span * fracOf(pos.x))
                         lastX = pos.x; lastT = SystemClock.uptimeMillis()
                     },
-                    onDragEnd = { dragging = false; onValueChangeFinished() },
-                    onDragCancel = { dragging = false; onValueChangeFinished() },
+                    onDragEnd = { dragging = false; finish.value() },
+                    onDragCancel = { dragging = false; finish.value() },
                 ) { change, _ ->
                     change.consume()
                     val x = change.position.x
@@ -155,7 +166,7 @@ fun TickerSlider(
                     lastX = x; lastT = t
                     val idx = idxOf(start + span * fracOf(x))
                     if (idx != lastTick) { lastTick = idx; hapticTick(speed) }
-                    onValueChange((start + idx * snapStep).coerceIn(start, valueRange.endInclusive))
+                    emit.value((start + idx * snapStep).coerceIn(start, valueRange.endInclusive))
                 }
             }
     ) {
