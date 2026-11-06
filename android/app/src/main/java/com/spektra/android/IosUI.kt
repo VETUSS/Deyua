@@ -44,18 +44,31 @@ import androidx.compose.ui.unit.dp
 object Haptics {
     fun tick(ctx: Context) = play(ctx, if (Build.VERSION.SDK_INT >= 29) VibrationEffect.EFFECT_TICK else -1)
 
+    /** 危险操作（删除）：稍重，给一点阻抗。 */
     fun warn(ctx: Context) = play(ctx, if (Build.VERSION.SDK_INT >= 29) VibrationEffect.EFFECT_CLICK else -1)
 
-    private fun play(ctx: Context, effect: Int) {
+    /**
+     * 「落位」——值被吸回默认档位的那一下（r39，曲线控制点回位用）。
+     *
+     * 为什么不能复用 [tick]：tick 是「收到了」，很轻，拖动时每帧都在响，属于背景音；
+     * 回位是**一个事件**（从"改过"变回"没改"），必须有量级差，否则用户分不清自己到底
+     * 回没回位。也不该借 [warn] 的语义（那是阻抗）。取 EFFECT_CLICK：比 tick 实、比长震短，
+     * 像拨盘卡进档位。API 26–28 没有效果分级，退化成 16ms 一次性短震 —— 仍明显重于 tick。
+     */
+    fun detent(ctx: Context) = play(ctx, if (Build.VERSION.SDK_INT >= 29) VibrationEffect.EFFECT_CLICK else -1,
+        fallbackMs = 16)
+
+    private fun play(ctx: Context, effect: Int, fallbackMs: Long = 6) {
         runCatching {
             val v = ctx.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
             if (!v.hasVibrator()) return
             if (effect >= 0) {
                 v.vibrate(VibrationEffect.createPredefined(effect))
             } else if (Build.VERSION.SDK_INT >= 26) {
-                v.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK))
+                if (fallbackMs > 8) v.vibrate(VibrationEffect.createOneShot(fallbackMs, 120))
+                else v.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_TICK))
             } else {
-                @Suppress("DEPRECATION") v.vibrate(6)
+                @Suppress("DEPRECATION") v.vibrate(fallbackMs)
             }
         }
     }

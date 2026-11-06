@@ -146,9 +146,9 @@ fun ToneTab(
 
         Text(
             if (points == Layer2.LINEAR)
-                "五个控制点沿对角线 = 不改动。往上拖提亮、往下拖压暗；曲线永远单调，不会打结"
+                "沿对角线 = 不改动。上拖提亮、下拖压暗；拖回默认位置会轻震一下"
             else
-                "已调整 · 单调三次插值：拉得再陡也不会出反相的亮边",
+                "已调整 · 单调三次插值，拉得再陡也不会打结；拖回原位轻震一下",
             color = if (points == Layer2.LINEAR) Dv.label4 else chanTint.copy(alpha = 0.75f),
             fontSize = 9.5f.sp, lineHeight = 13.sp,
             modifier = Modifier.fillMaxWidth().padding(start = 2.dp, top = 2.dp, bottom = 4.dp),
@@ -340,14 +340,43 @@ private fun CurveEditor(
                         if (h <= 0f) return 0.5f
                         return (1f - (y - pad) / h).coerceIn(0f, 1f)
                     }
+
+                    // [r39] 「回位」吸附：默认曲线每个点只有唯一一个 y。
+                    //
+                    // 两个都要做，缺一个就不成立：
+                    //  · 只震不吸 —— 用户"看着回位了"，其实还差 0.002，页头仍是"已调整"，
+                    //    曲线也仍不是直线，等于骗人；
+                    //  · 只吸不震 —— 手指压着屏幕看不到那 2dp 的位移，不知道什么时候吸上的。
+                    //
+                    // 窄带 ±0.014（约 ±2dp）只覆盖"确实想归零"的动作，正常微调完全不受影响。
+                    val homeBand = 0.014f
+                    fun snapHome(i: Int, v: Float): Float =
+                        if (abs(v - Layer2.LINEAR[i]) <= homeBand) Layer2.LINEAR[i] else v
+
+                    // 本次按下期间是否已经报过"在默认位"。放在块内而不是 remember：
+                    // 它只决定"要不要补那一下震动"，不该引起重组。
+                    var homeLatch = false
+                    // 上一帧的值：用来判断"跨过去"。
+                    // 快速拖动时一帧能走十几个像素，±2dp 的窄带可能被整帧跳过 ——
+                    // 只靠"是否落在带内"会漏震，手感就是时有时无。跨过也补一下。
+                    var prevV = 0f
+                    // 手指压在带边抖动时，in/out 会来回切换 —— 加一道 220ms 的最小间隔，
+                    // 让"回到默认位"始终是一件能被数清次数的事，而不是振颤。
+                    var lastDetentMs = 0L
+
                     detectDragGestures(
                         onDragStart = { pos ->
                             val i = nearest(pos)
                             dragIdx = i
+                            homeLatch = false
                             if (i >= 0) {
                                 Haptics.tick(ctx)
+                                val v = snapHome(i, valueAt(pos.y))
+                                prevV = v
+                                // 按下去时本来就在默认位：不补落位震（press 已经 tick 过一次）
+                                homeLatch = v == Layer2.LINEAR[i]
                                 val np = pts.toMutableList()
-                                np[i] = valueAt(pos.y)
+                                np[i] = v
                                 emit(np)
                             }
                         },
@@ -355,8 +384,25 @@ private fun CurveEditor(
                             val i = dragIdx
                             if (i >= 0) {
                                 change.consume()
+                                val home = Layer2.LINEAR[i]
+                                val raw = valueAt(change.position.y)
+                                val inBand = abs(raw - home) <= homeBand
+                                val crossed = (prevV - home) * (raw - home) < 0f
+                                val v = if (inBand) home else raw
+                                // 只在"进入/越过"那一刻震：手指在带里来回抖动不会连震
+                                if ((inBand || crossed) && !homeLatch) {
+                                    val now = android.os.SystemClock.uptimeMillis()
+                                    if (now - lastDetentMs > 220L) {
+                                        Haptics.detent(ctx)
+                                        lastDetentMs = now
+                                    }
+                                    homeLatch = true
+                                } else if (!inBand && !crossed) {
+                                    homeLatch = false
+                                }
+                                prevV = v
                                 val np = pts.toMutableList()
-                                np[i] = valueAt(change.position.y)
+                                np[i] = v
                                 emit(np)
                             }
                         },
@@ -414,7 +460,13 @@ private fun CurveEditor(
                 val cx = l + w * (i + 1f) / (Layer2.CP + 1)
                 val cy = t + h * (1f - points.getOrElse(i) { Layer2.LINEAR[i] })
                 val active = i == dragIdx
+                // [r39] 已吸附回默认位：多一圈极细的环。屏幕上的"归位"和手上那一下震动
+                // 必须同时发生，否则用户会以为自己没拖到、反复来回找那个点。
+                val atHome = active &&
+                    abs(points.getOrElse(i) { Layer2.LINEAR[i] } - Layer2.LINEAR[i]) < 1e-4f
                 if (active) drawCircle(tint.copy(alpha = 0.22f), radius = 13f, center = Offset(cx, cy))
+                if (atHome) drawCircle(tint.copy(alpha = 0.6f), radius = 10.5f, center = Offset(cx, cy),
+                    style = Stroke(width = 1.1f))
                 drawCircle(Dv.root, radius = if (active) 7.5f else 5.5f, center = Offset(cx, cy))
                 drawCircle(tint, radius = if (active) 5f else 3.4f, center = Offset(cx, cy))
             }
