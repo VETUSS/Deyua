@@ -1,0 +1,26 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// spk_overscan_film_present.comp -- GLSL translation of `spk_overscan_film_present`
+// in overscan.metal (RFC-032 §26-§27): where there is no film (perforations,
+// outside the strip) the negative's density goes to the cmy that cancels this
+// film's base, so the enlarger or scanner sees clear light.
+layout(local_size_x = 256) in;
+
+#include "spk_overscan.glsl"
+
+layout(std430, binding = 0) readonly buffer Cmy { float cmy[]; };
+layout(std430, binding = 2) readonly buffer Count { uint n[]; };
+layout(std430, binding = 3) writeonly buffer Out { float outb[]; };
+
+void main() {
+    const uint i = spk_global_index();
+    if (i >= n[0]) return;
+    const uint cw = uint(P[P_CW]);
+    const float a = film_alpha(canvas_to_film(float(i % cw), float(i / cw)));
+    const vec3 c = vec3(cmy[3u * i], cmy[3u * i + 1u], cmy[3u * i + 2u]);
+    const vec3 hole = vec3(P[P_HOLE_C], P[P_HOLE_M], P[P_HOLE_Y]);
+    const vec3 r3 = a * c + (1.0 - a) * hole;
+    outb[3u * i] = r3.x;
+    outb[3u * i + 1u] = r3.y;
+    outb[3u * i + 2u] = r3.z;
+}

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- r14：与 Compose 侧 Dv.root 完全同色。系统栏/窗口底色若留纯黑，
+         会在暖炭黑的画布上压出一道冷黑色的边，一眼就能看出"两块不同的黑"。 -->
+    <color name="deyva_root">#FF0B0A08</color>
+</resources>

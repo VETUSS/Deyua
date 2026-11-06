@@ -1,0 +1,26 @@
+# 构建产物
+build/
+.cxx/
+.gradle/
+.kotlin/
+local.properties
+*.apk
+*.aab
+*.idsig
+*.iml
+.idea/
+
+# 签名密钥与密码：绝不入库。
+# 私钥一旦公开，任何人都能签出与该应用同指纹的安装包。
+*.keystore
+*.jks
+*.pass
+
+# 第三方源码：由 upstream/engine/setup-libraw.sh 获取，不入库
+upstream/build/
+upstream/engine/build/
+
+# 系统噪声
+.DS_Store
+Thumbs.db
+desktop.ini
