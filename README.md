@@ -7,6 +7,23 @@ Android 端的胶片模拟冲洗应用。导入一张照片，选择胶片与相
 胶片过程模型、28 个实测色彩 profile 与打印 LUT 来自
 [spektrafilm](https://github.com/andreavolpato/spektrafilm)（Andrea Volpato）。
 
+## 下载
+
+安装包发布在 [Releases](https://github.com/VETUSS/Deyua/releases) 页面。最新版本：
+
+**[Deyva v0.8.93-r32](https://github.com/VETUSS/Deyua/releases/download/v0.8.93-r32/Deyva-v0.8.93-r32.apk)** ·
+24,945,069 字节 · Android 7.0+ · arm64-v8a · `com.spektra.android`
+
+侧载安装，需允许「安装未知来源应用」。下载后可核对完整性：
+
+```
+SHA-256  e1f392f29982a4fe81c8afab854423bfca71c3b375f4d53d112d4fb4fffce958
+```
+
+官方构建的签名证书 SHA-256 为
+`bd5b1581425b953da52ab9550bf5149c52c30277a36d8358443cb0fa358c8236`，
+应用内「关于 Deyva」会显示当前包是官方构建还是第三方重签版本。
+
 ## 许可
 
 | 部分 | 许可 |
