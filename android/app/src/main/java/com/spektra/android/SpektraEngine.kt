@@ -88,15 +88,27 @@ class SpektraEngine(private val context: Context) {
 
     /** 渲染结果转 Bitmap（RGBA8）。quiet=true 时不打渲染日志（缩略图逐张渲染，26 张会刷满日志）。 */
     fun renderToBitmap(session: Long, tier: String, quiet: Boolean = false): Bitmap? {
-        val wh = IntArray(2)
-        // 三段计时：native 不返回 / ShortArray 回传 / 转 Bitmap，卡死时能一眼分清
-        val t0 = System.currentTimeMillis()
-        val rgba16 = render(session, tier, wh) ?: return null
+        val f = renderFrame(session, tier, quiet) ?: return null
         val t1 = System.currentTimeMillis()
-        if (!quiet) Diagnostics.log("render", "    native ${t1 - t0}ms ${wh[0]}x${wh[1]}")
-        val bmp = toBitmap(rgba16, wh[0], wh[1])
+        val bmp = f.toBitmap()
         if (!quiet) Diagnostics.log("render", "    bitmap ${System.currentTimeMillis() - t1}ms")
         return bmp
+    }
+
+    /**
+     * [r37] 渲染成**未降位**的 rgba16，供 Layer 2 在 16 bit 上处理。
+     *
+     * 调色必须在 16 bit 上做：先降到 8 bit 再拉曲线，斜率大于 1 的段落每两级之间会
+     * 空出 2–6 个码值，就是肉眼可见的色阶断层。这条路径把它留给 Layer2.apply16，
+     * 只有在最后写 Bitmap 时才降到 8 bit（并在那里抖动）。
+     */
+    fun renderFrame(session: Long, tier: String, quiet: Boolean = false): Frame16? {
+        val wh = IntArray(2)
+        val t0 = System.currentTimeMillis()
+        val rgba16 = render(session, tier, wh) ?: return null
+        if (!quiet) Diagnostics.log("render", "    native ${System.currentTimeMillis() - t0}ms ${wh[0]}x${wh[1]}")
+        if (wh[0] <= 0 || wh[1] <= 0) return null
+        return Frame16(rgba16, wh[0], wh[1])
     }
 
     /**
@@ -106,6 +118,15 @@ class SpektraEngine(private val context: Context) {
      * 第一次渲染前没有负片缓存，native 会抛错；这里返回 null，调用方回退到完整渲染。
      */
     fun reprintToBitmap(session: Long, tier: String, quiet: Boolean = false): Bitmap? {
+        val f = reprintFrame(session, tier, quiet) ?: return null
+        val t1 = System.currentTimeMillis()
+        val bmp = f.toBitmap()
+        if (!quiet) Diagnostics.log("render", "    reprint bitmap ${System.currentTimeMillis() - t1}ms")
+        return bmp
+    }
+
+    /** [r37] 重印的 16 bit 版本，与 [reprintToBitmap] 同一份字节，只是不降位。 */
+    fun reprintFrame(session: Long, tier: String, quiet: Boolean = false): Frame16? {
         val wh = IntArray(2)
         val t0 = System.currentTimeMillis()
         val rgba16 = try {
@@ -114,11 +135,9 @@ class SpektraEngine(private val context: Context) {
             if (!quiet) Diagnostics.log("render", "    reprint 不可用：${e.message}")
             return null
         } ?: return null
-        val t1 = System.currentTimeMillis()
-        if (!quiet) Diagnostics.log("render", "    reprint native ${t1 - t0}ms ${wh[0]}x${wh[1]}")
-        val bmp = toBitmap(rgba16, wh[0], wh[1])
-        if (!quiet) Diagnostics.log("render", "    reprint bitmap ${System.currentTimeMillis() - t1}ms")
-        return bmp
+        if (!quiet) Diagnostics.log("render", "    reprint native ${System.currentTimeMillis() - t0}ms ${wh[0]}x${wh[1]}")
+        if (wh[0] <= 0 || wh[1] <= 0) return null
+        return Frame16(rgba16, wh[0], wh[1])
     }
 
     /**
@@ -143,20 +162,9 @@ class SpektraEngine(private val context: Context) {
     /** 哪些相纸有随包烘焙的 LUT（JSON）。 */
     fun printLutCatalog(): String = nativePrintLutCatalog(enginePtr)
 
-    /** rgba16（每通道 u16）→ ARGB_8888。 */
-    private fun toBitmap(rgba16: ShortArray, w: Int, h: Int): Bitmap? {
-        if (w <= 0 || h <= 0) return null
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val px = IntArray(w * h)
-        for (i in px.indices) {
-            val r = rgba16[i * 4].toInt() and 0xFFFF
-            val g = rgba16[i * 4 + 1].toInt() and 0xFFFF
-            val b = rgba16[i * 4 + 2].toInt() and 0xFFFF
-            px[i] = (0xFF shl 24) or ((r shr 8) shl 16) or ((g shr 8) shl 8) or (b shr 8)
-        }
-        bmp.setPixels(px, 0, w, 0, 0, w, h)
-        return bmp
-    }
+    /** rgba16（每通道 u16）→ ARGB_8888。带抖动，见 [Frame16.convert]。 */
+    private fun toBitmap(rgba16: ShortArray, w: Int, h: Int): Bitmap? =
+        Frame16.convert(rgba16, w, h)
 
     fun sessionRelease(session: Long) = nativeSessionRelease(session)
     fun warmUp(film: String, print: String): String = nativeWarmUp(enginePtr, film, print)
@@ -215,6 +223,62 @@ class SpektraEngine(private val context: Context) {
             System.loadLibrary("jni_bridge")
             // 独立的 RAW 解码库（含 LibRaw + 引擎 raw_decoder）
             System.loadLibrary("jni_raw")
+        }
+    }
+}
+
+/**
+ * 一帧引擎原样的 rgba16（每通道 u16，RGBA 交错）。
+ *
+ * [r37] 引入它，是因为 `renderToBitmap` 原来的转换是 `v shr 8` —— 引擎辛苦算出来的
+ * 16 bit 被直接砍掉低 8 位。只是看图没问题，但接下来要拉曲线：在 256 级上做斜率大于 1
+ * 的曲线，相邻输入级会被映射到相差 2–6 个码值，成片上就是一条条色阶断层。
+ * 把 16 bit 留到调色之后，断层就没有了 —— 只剩最后的 1 个码值舍入，交给 Bayer 抖动打散。
+ */
+class Frame16(val px: ShortArray, val w: Int, val h: Int) {
+
+    fun toBitmap(): Bitmap? = convert(px, w, h)
+
+    companion object {
+        /** 8×8 Bayer，0–63。降到 8 bit 时用它做 ±0.5 码值的抖动。 */
+        private val BAYER8 = intArrayOf(
+            0, 32, 8, 40, 2, 34, 10, 42,
+            48, 16, 56, 24, 50, 18, 58, 26,
+            12, 44, 4, 36, 14, 46, 6, 38,
+            60, 28, 52, 20, 62, 30, 54, 22,
+            3, 35, 11, 43, 1, 33, 9, 41,
+            51, 19, 59, 27, 49, 17, 57, 25,
+            15, 47, 7, 39, 13, 45, 5, 37,
+            63, 31, 55, 23, 61, 29, 53, 21,
+        )
+
+        fun convert(rgba16: ShortArray, w: Int, h: Int): Bitmap? {
+            if (w <= 0 || h <= 0) return null
+            if (rgba16.size < w * h * 4) return null
+            val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val px = IntArray(w * h)
+            var i = 0
+            for (y in 0 until h) {
+                val rowD = (y and 7) shl 3
+                for (x in 0 until w) {
+                    // 抖动幅度 ±128（16 bit 尺度）= ±0.5 个 8 bit 码值。
+                    //
+                    // 映射用 /65535 而不是 >>8：65535 / 255 = 257，右移会把 65534 也变成
+                    // 255，白点提前 1/255 就焊死；而这里 65534 落在 254.996，抖动后仍能
+                    // 一半像素落在 255 —— 亮部才有可分辨的层次，而不是死白一片。
+                    val d = (BAYER8[rowD or (x and 7)] - 32) * 4
+                    val r = (rgba16[i * 4].toInt() and 0xFFFF) * 255 + 32767 + d
+                    val g = (rgba16[i * 4 + 1].toInt() and 0xFFFF) * 255 + 32767 + d
+                    val b = (rgba16[i * 4 + 2].toInt() and 0xFFFF) * 255 + 32767 + d
+                    px[i] = (0xFF shl 24) or
+                        ((r / 65535).coerceIn(0, 255) shl 16) or
+                        ((g / 65535).coerceIn(0, 255) shl 8) or
+                        (b / 65535).coerceIn(0, 255)
+                    i++
+                }
+            }
+            bmp.setPixels(px, 0, w, 0, 0, w, h)
+            return bmp
         }
     }
 }

@@ -165,7 +165,10 @@ object Layer2 {
     // ================================================================ 曲线
 
     /**
-     * 曲线控制点 → 256 项查找表。
+     * 曲线控制点 → 查找表。
+     *
+     * [n] 是表长：8 bit 路径用 256（一输入级一项，无需插值），16 bit 路径用 [LUT16]，
+     * 查表时再线性插值 —— 65536 项的表建一次要十几毫秒，拖动时每帧重建不值得。
      *
      * 用 Fritsch–Carlson 单调三次 Hermite 而不是普通 Catmull-Rom：后者在控制点拉得
      * 很陡时会**过冲**，出一条反相的亮边（暗部被压到负、高光冲到 1 以上再裁掉），
@@ -174,7 +177,7 @@ object Layer2 {
      * 另外这里会顺序修复非单调输入：用户把第 3 个点拖到第 2 个点下面时，
      * 不会得到一条打结的曲线，而是自动把它顶平 —— 与 Lightroom 的行为一致。
      */
-    fun curveLut(ys: List<Float>): FloatArray {
+    fun curveLut(ys: List<Float>, samples: Int = 256): FloatArray {
         val n = CP + 2
         val xs = DoubleArray(n)
         val yy = DoubleArray(n)
@@ -206,10 +209,10 @@ object Layer2 {
             }
         }
 
-        val lut = FloatArray(256)
+        val lut = FloatArray(samples)
         var k = 0
-        for (i in 0..255) {
-            val x = i / 255.0
+        for (i in 0 until samples) {
+            val x = i / (samples - 1.0)
             while (k < n - 2 && x > xs[k + 1]) k++
             val hseg = xs[k + 1] - xs[k]
             val t = ((x - xs[k]) / hseg).coerceIn(0.0, 1.0)
@@ -284,6 +287,155 @@ object Layer2 {
         return dst
     }
 
+    // ================================================================ 16 bit 入口
+
+    /**
+     * 16 bit 路径的表长。
+     *
+     * 8 bit 路径一张 256 项的表正好是「一输入级一项」，不需要插值；16 bit 有 65536 级，
+     * 照做的话每帧要建 3×65536 项的表，拖动时不划算。1024 项 + 线性插值的误差在
+     * 8 bit 输出上不到 0.1 个码值 —— 比抖动本身还小一个数量级。
+     */
+    private const val LUT16 = 1024
+
+    private const val U16_TO_UNIT = 1f / 65535f
+
+    /**
+     * 对引擎原样的 rgba16 施加 Layer 2，直接出 8 bit Bitmap；16 bit 数据不够时返回 null。
+     *
+     * 这条路径存在的理由只有一条：**大幅曲线不能在 8 bit 上做**。
+     *
+     * 引擎（`nativeRender`）给的是每通道 u16，而旧的 `renderToBitmap` 一句 `v shr 8`
+     * 就把它砍成 8 bit，之后拉曲线只能在 256 级里挪。曲线斜率大于 1 的地方，相邻输入级
+     * 会被映射到输出相差 2–6 个码值 —— 这就是成片上的色阶断层（Photoshop 8 位模式拉
+     * 曲线同理，它靠 16 位模式 + dither 掩盖）。这里保留 16 bit 到最后一刻：同一根曲线
+     * 作用在 65536 级上是连续的，只有最后落到 8 bit 时才有 1 个码值的舍入，交给抖动打散。
+     *
+     * [px] 是 RGBA 交错的 u16，即 `nativeRender` 的原样输出（长度 w*h*4）。
+     */
+    fun apply16(px: ShortArray, w: Int, h: Int, c: Cfg): Bitmap? {
+        if (w <= 0 || h <= 0) return null
+        if (px.size < w * h * 4) return null
+        if (c.isIdentity) return null      // 没调色：调用方直接用 8 bit 原图，零成本
+
+        val lutA = buildToneLut(c, LUT16)
+        val lutB = buildCurveLut(c, LUT16)
+        val satK = 1f + c.saturation / 100f
+        val zone = buildZoneMats(c)
+        val vigAmt = c.vignette / 100f * 0.85f
+        val vigMid = (c.vignetteMid / 100f).coerceIn(0.02f, 0.98f)
+        val vig = abs(vigAmt) > 0.001f
+
+        val cx = (w - 1) * 0.5f
+        val cy = (h - 1) * 0.5f
+        val ctx = Args(
+            w = w, cx = cx, cy = cy,
+            invCx = if (cx > 0f) 1f / cx else 0f, invCy = if (cy > 0f) 1f / cy else 0f,
+            aR = lutA[0], aG = lutA[1], aB = lutA[2],
+            bR = lutB[0], bG = lutB[1], bB = lutB[2],
+            satK = satK, zoneMat = zone.first, zoneOff = zone.second,
+            vigAmt = vigAmt, vigMid2 = vigMid * vigMid, vig = vig,
+        )
+
+        val dst = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val rowsPerStrip = (STRIP_PX / w).coerceIn(1, h)
+        val buf = IntArray(w * rowsPerStrip)
+        var y = 0
+        while (y < h) {
+            val rows = minOf(rowsPerStrip, h - y)
+            runBuckets16(px, buf, y, rows, ctx)
+            dst.setPixels(buf, 0, w, 0, y, w, rows)
+            y += rows
+        }
+        return dst
+    }
+
+    /** 与 [runBuckets] 同一套切分，只是源缓冲是交错的 u16。 */
+    private fun runBuckets16(px: ShortArray, out: IntArray, yBase: Int, rows: Int, c: Args) {
+        val threads = Runtime.getRuntime().availableProcessors().coerceIn(1, 4)
+        if (rows < 64 || threads == 1) {
+            rows16(px, out, yBase, 0, rows, c)
+            return
+        }
+        val band = (rows + threads - 1) / threads
+        val workers = ArrayList<Thread>(threads)
+        for (ti in 0 until threads) {
+            val r0 = ti * band
+            val r1 = minOf(rows, r0 + band)
+            if (r0 >= r1) break
+            val t = Thread { rows16(px, out, yBase, r0, r1, c) }
+            t.isDaemon = true
+            t.priority = Thread.NORM_PRIORITY
+            t.start()
+            workers.add(t)
+        }
+        for (t in workers) runCatching { t.join() }
+    }
+
+    /** 16 bit 版的逐行主体；步骤与顺序和 [processRows] 一一对应。 */
+    private fun rows16(px: ShortArray, out: IntArray, yBase: Int, r0: Int, r1: Int, c: Args) {
+        val w = c.w
+        val aR = c.aR; val aG = c.aG; val aB = c.aB
+        val bR = c.bR; val bG = c.bG; val bB = c.bB
+        val satK = c.satK
+        val zoneMat = c.zoneMat; val zoneOff = c.zoneOff
+        val bayer = BAYER8
+        for (r in r0 until r1) {
+            val yAbs = yBase + r
+            val dy = (yAbs - c.cy) * c.invCy
+            val dy2 = dy * dy
+            val srcBase = yAbs * w * 4
+            val rowOut = r * w
+            val brow = (yAbs and 7) shl 3
+            for (x in 0 until w) {
+                val si = srcBase + x * 4
+                // ---- 1–4 · 白平衡 / 曝光 / 对比 / 亮度 / 高光阴影 / 黑白场 ----
+                var rr = sampleAt(aR, (px[si].toInt() and 0xFFFF) * U16_TO_UNIT)
+                var gg = sampleAt(aG, (px[si + 1].toInt() and 0xFFFF) * U16_TO_UNIT)
+                var bb = sampleAt(aB, (px[si + 2].toInt() and 0xFFFF) * U16_TO_UNIT)
+
+                // ---- 5 · 饱和度 ----
+                if (satK != 1f) {
+                    val l = 0.2126f * rr + 0.7152f * gg + 0.0722f * bb
+                    rr = l + (rr - l) * satK
+                    gg = l + (gg - l) * satK
+                    bb = l + (bb - l) * satK
+                }
+
+                // ---- 6 · 色彩平衡 ----
+                val l2 = 0.2126f * rr + 0.7152f * gg + 0.0722f * bb
+                val zi = (l2 * 32f).toInt().coerceIn(0, 32)
+                val mi = zi * 9
+                val o = zoneOff[zi]
+                val nr = zoneMat[mi] * rr + zoneMat[mi + 1] * gg + zoneMat[mi + 2] * bb + o
+                val ng = zoneMat[mi + 3] * rr + zoneMat[mi + 4] * gg + zoneMat[mi + 5] * bb + o
+                val nb = zoneMat[mi + 6] * rr + zoneMat[mi + 7] * gg + zoneMat[mi + 8] * bb + o
+
+                // ---- 7 · 曲线 ----
+                rr = sampleAt(bR, nr.coerceIn(0f, 1f))
+                gg = sampleAt(bG, ng.coerceIn(0f, 1f))
+                bb = sampleAt(bB, nb.coerceIn(0f, 1f))
+
+                // ---- 8 · 暗角 ----
+                if (c.vig) {
+                    val dx = (x - c.cx) * c.invCx
+                    val r2 = dx * dx + dy2
+                    val t = ((r2 - c.vigMid2) / (1f - c.vigMid2)).coerceIn(0f, 1f)
+                    val s = t * t * (3f - 2f * t)
+                    val k = 1f - c.vigAmt * s
+                    rr *= k; gg *= k; bb *= k
+                }
+
+                // 最后才是 8 bit：只剩 1 个码值的舍入，抖动把它变成看不出方向的噪点
+                val d = bayer[brow or (x and 7)]
+                val ri = (rr * 255f + d).toInt().coerceIn(0, 255)
+                val gi = (gg * 255f + d).toInt().coerceIn(0, 255)
+                val bi = (bb * 255f + d).toInt().coerceIn(0, 255)
+                out[rowOut + x] = (0xFF shl 24) or (ri shl 16) or (gi shl 8) or bi
+            }
+        }
+    }
+
     /** 一次调色运算里所有不变的量，避免在行循环里传十几个参数。 */
     private class Args(
         val w: Int, val cx: Float, val cy: Float, val invCx: Float, val invCy: Float,
@@ -327,13 +479,13 @@ object Layer2 {
         val bR = c.bR; val bG = c.bG; val bB = c.bB
         val satK = c.satK
         val zoneMat = c.zoneMat; val zoneOff = c.zoneOff
-        val bayer = BAYER4
+        val bayer = BAYER8
         for (r in r0 until r1) {
             val yAbs = yBase + r
             val dy = (yAbs - c.cy) * c.invCy
             val dy2 = dy * dy
             val row = r * w
-            val brow = (yAbs and 3) shl 2
+            val brow = (yAbs and 7) shl 3
             for (x in 0 until w) {
                 val p = px[row + x]
                 var rr = ((p shr 16) and 0xFF) * (1f / 255f)
@@ -380,7 +532,7 @@ object Layer2 {
                 }
 
                 // 抖动：给 8 bit 输出加半个码值的有序噪声，把曲线拉伸后的色阶断层打散
-                val d = bayer[brow or (x and 3)]
+                val d = bayer[brow or (x and 7)]
                 val ri = (rr * 255f + d).toInt().coerceIn(0, 255)
                 val gi = (gg * 255f + d).toInt().coerceIn(0, 255)
                 val bi = (bb * 255f + d).toInt().coerceIn(0, 255)
@@ -400,7 +552,7 @@ object Layer2 {
      * 用 sRGB 编码值（Bitmap 里的原始 0–255）而不是线性光：这是 Lightroom、Photoshop
      * 曲线的做法，用户预期也是那个手感。物理上不严格，但调色本来就是在显示域做的主观决定。
      */
-    private fun buildToneLut(c: Cfg): Array<FloatArray> {
+    private fun buildToneLut(c: Cfg, samples: Int = 256): Array<FloatArray> {
         // 白平衡：暖 = 加红减蓝；品红 = 减绿。最后按亮度归一，避免一调色温整体忽明忽暗。
         val t = c.temp / 100f
         val ti = c.tint / 100f
@@ -422,12 +574,13 @@ object Layer2 {
         val bp = c.blacks / 100f * 0.18f
         val wp = c.whites / 100f * 0.18f
 
-        val out = Array(3) { FloatArray(256) }
+        val out = Array(3) { FloatArray(samples) }
+        val denom = (samples - 1).toFloat()
         for (ch in 0..2) {
             val gain = gains[ch]
             val arr = out[ch]
-            for (i in 0..255) {
-                var v = (i / 255f) * gain
+            for (i in 0 until samples) {
+                var v = (i / denom) * gain
                 v *= expo
                 // 对比：绕 0.5 的线性拉伸。超出 0–1 的部分留到最后统一裁，
                 // 但高光/阴影的权重函数会先看到真实值，所以压暗不会被过早截断。
@@ -461,18 +614,22 @@ object Layer2 {
         return out
     }
 
-    /** 曲线：RGB 复合曲线在前，单通道曲线在后，两级串联烘成一张表。 */
-    private fun buildCurveLut(c: Cfg): Array<FloatArray> {
-        val rgb = curveLut(c.curveRgb)
-        val r = curveLut(c.curveR)
-        val g = curveLut(c.curveG)
-        val b = curveLut(c.curveB)
-        val out = Array(3) { FloatArray(256) }
-        for (i in 0..255) {
-            val k = (rgb[i] * 255f + 0.5f).toInt().coerceIn(0, 255)
-            out[0][i] = r[k]
-            out[1][i] = g[k]
-            out[2][i] = b[k]
+    /**
+     * 曲线：RGB 复合曲线在前，单通道曲线在后，两级串联烘成一张表。
+     *
+     * 串联时对前一级的结果做**插值取样**而不是四舍五入到表项：16 bit 路径的表只有
+     * [LUT16] 项，若在这里先量化一次，等于把刚保住的那 8 位精度又扔掉一截。
+     */
+    private fun buildCurveLut(c: Cfg, samples: Int = 256): Array<FloatArray> {
+        val rgb = curveLut(c.curveRgb, samples)
+        val r = curveLut(c.curveR, samples)
+        val g = curveLut(c.curveG, samples)
+        val b = curveLut(c.curveB, samples)
+        val out = Array(3) { FloatArray(samples) }
+        for (i in 0 until samples) {
+            out[0][i] = sampleAt(r, rgb[i])
+            out[1][i] = sampleAt(g, rgb[i])
+            out[2][i] = sampleAt(b, rgb[i])
         }
         return out
     }
@@ -604,13 +761,37 @@ object Layer2 {
         return t * t * (3f - 2f * t)
     }
 
-    /** 4×4 Bayer，已归一化到 ±0.5，加在 0–255 的浮点上就是半个码值。 */
-    private val BAYER4 = FloatArray(16) {
-        floatArrayOf(
-            0f, 8f, 2f, 10f,
-            12f, 4f, 14f, 6f,
-            3f, 11f, 1f, 9f,
-            15f, 7f, 13f, 5f,
-        )[it] / 16f - 0.5f
+    /**
+     * 在 0–1 的定义域上对一张等距表做线性插值。
+     *
+     * 表长 ≥ 1024 时这项误差在 8 bit 输出上不到 0.1 个码值，可以忽略；用它换来的是
+     * 建表成本只有 65536 项表的 1/64（拖动时每帧都要重建）。
+     */
+    private fun sampleAt(lut: FloatArray, v: Float): Float {
+        val t = v * (lut.size - 1)
+        val i = t.toInt().coerceIn(0, lut.size - 2)
+        val f = t - i
+        val a = lut[i]
+        return a + (lut[i + 1] - a) * f
+    }
+
+    /**
+     * 8×8 Bayer，归一化到 ±0.5。
+     *
+     * [r37] 从 4×4 换成 8×8：4×4 只有 16 个相位，在天空这类大面积平滑渐变上会显成
+     * 一层细网格（尤其缩放系数不是整数时还会和像素栅格打架）。8×8 是 64 个相位，
+     * 肉眼把它读成噪点而不是图案，代价只是多一次数组索引。
+     */
+    private val BAYER8 = FloatArray(64) {
+        intArrayOf(
+            0, 32, 8, 40, 2, 34, 10, 42,
+            48, 16, 56, 24, 50, 18, 58, 26,
+            12, 44, 4, 36, 14, 46, 6, 38,
+            60, 28, 52, 20, 62, 30, 54, 22,
+            3, 35, 11, 43, 1, 33, 9, 41,
+            51, 19, 59, 27, 49, 17, 57, 25,
+            15, 47, 7, 39, 13, 45, 5, 37,
+            63, 31, 55, 23, 61, 29, 53, 21,
+        )[it] / 64f - 0.5f
     }
 }

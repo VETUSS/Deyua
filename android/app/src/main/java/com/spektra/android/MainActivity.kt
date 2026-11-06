@@ -280,6 +280,10 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
     // 再跑一遍 Layer 2（十几毫秒），这才是实时。
     var previewBase by remember { mutableStateOf<Bitmap?>(null) }
     var preview by remember { mutableStateOf<Bitmap?>(null) }
+    // [r37] 与 previewBase 配套的 16 bit 原帧。调色走 Layer2.apply16 —— 先降到 8 bit
+    // 再拉曲线，斜率大于 1 的段落会空出色阶，就是"幅度稍大就断层"。渲染失败的帧这里是 null，
+    // 调色会自动退回 8 bit 路径（画面正确，只是断层会回来）。
+    var renderRaw by remember { mutableStateOf<Frame16?>(null) }
     // Layer 2 参数，以及曲线背后那张直方图（从**调色之后**的图算，所以它反映的是输出）
     var tone by remember { mutableStateOf(Layer2.Cfg()) }
     var toneHist by remember { mutableStateOf<Layer2.Hist?>(null) }
@@ -820,23 +824,30 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                         // [r11·第0批] 只改了 PRINT 层（相纸 / 放大机 / 光泽）时走 spk_reprint：
                         // 复用已缓存的负片直接重印相纸，跳过重冲 —— 这是"切相纸慢"的根因解。
                         // 首次渲染没有负片缓存会失败，此时自动回退到完整渲染，行为不变。
-                        var b: Bitmap? = null
+                        var frame: Frame16? = null
                         val prevDelta = lastRenderedDelta.get()
                         if (prevDelta != null && onlyPrintLayerChanged(prevDelta, delta)) {
                             stage.set("reprint")
                             val tRp = System.currentTimeMillis()
-                            b = eng.reprintToBitmap(sess, "live")
-                            if (b != null) {
+                            frame = eng.reprintFrame(sess, "live")
+                            if (frame != null) {
                                 Diagnostics.log("render", "  reprint 命中（只改 PRINT 层，免重冲）${System.currentTimeMillis() - tRp}ms")
                             } else {
                                 Diagnostics.log("render", "  reprint 未命中，回退完整渲染")
                             }
                         }
-                        if (b == null) {
+                        if (frame == null) {
                             stage.set("renderToBitmap")
-                            b = eng.renderToBitmap(sess, "live")
+                            frame = eng.renderFrame(sess, "live")
                         }
+                        val tb = System.currentTimeMillis()
+                        val b = frame?.toBitmap()
+                        Diagnostics.log("render", "    bitmap ${System.currentTimeMillis() - tb}ms")
                         result = b
+                        // [r37] 原帧的 16 bit 也留着：调色必须在它上面做，降到 8 bit 再
+                        // 拉曲线就会空出色阶（见 Layer2.apply16 的注释）。渲染失败时清空，
+                        // 免得拿上一张图的 16 bit 去套这一张的 8 bit。
+                        renderRaw = if (b != null) frame else null
                         // 只有渲染真的成功才记快照，否则下一次仍会走完整渲染
                         if (b != null) lastRenderedDelta.set(delta)
                         Diagnostics.log("render", "  render ${System.currentTimeMillis() - st}ms")
@@ -1340,7 +1351,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
     // delay(16) 是必要的，不是凑数 —— 拖滑杆时 onValueChange 每帧都在改 tone，
     // 没有这个下限，每次改都会起一轮全图处理，几轮叠在一起反而更卡（它们互相抢 CPU）。
     // 16 ms 刚好一帧：用户看到的是「跟手」，而不是「一卡一卡地追手」。
-    LaunchedEffect(previewBase, tone) {
+    LaunchedEffect(previewBase, tone, renderRaw) {
         val base = previewBase
         if (base == null) { preview = null; toneHist = null; return@LaunchedEffect }
         delay(16)
@@ -1349,8 +1360,14 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
             toneHist = withContext(Dispatchers.Default) { Layer2.histogram(base) }
             return@LaunchedEffect
         }
+        val raw = renderRaw
         val r = withContext(Dispatchers.Default) {
-            val b = Layer2.apply(base, tone)
+            // 16 bit 优先；帧对不上（换图、渲染失败、自愈换了 session）就退回 8 bit。
+            // 退回时画面仍然正确，只是大幅曲线会重新出现色阶断层 —— 宁可这样也不要
+            // 拿上一张图的像素去调这一张。
+            val b = (if (raw != null && raw.w == base.width && raw.h == base.height)
+                Layer2.apply16(raw.px, raw.w, raw.h, tone) else null)
+                ?: Layer2.apply(base, tone)
             b to Layer2.histogram(b)
         }
         preview = r.first
@@ -2039,12 +2056,16 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                         Diagnostics.log("export", "开始导出 fmt=${fmt.label} color=$renderColor size=$sizeL q=$q dest=$saveDest stem=$stem")
                                         // [r5] 导出原来在裸线程里直接用主会话渲染，与预览渲染并发跑在
                                         // 同一个 VkDevice 上（GPU 挂起的一个来源）。收进闸门串行执行。
-                                        val fullRaw = withEngineGate(60000L, "export full") {
+                                        val fullFrame = withEngineGate(60000L, "export full") {
                                             eng.setParams(sess, "{\"output_color_space\":\"$renderColor\",\"output_cctf_encoding\":true}")
                                             setStep(1, true, false); setStep(2, false, true)
-                                            eng.renderToBitmap(sess, "full")
+                                            eng.renderFrame(sess, "full")
                                         }
-                                        if (fullRaw == null) { Diagnostics.log("export", "full 渲染失败 ${eng.lastError()}"); exportOk = false; status = "导出失败：全尺寸渲染失败"; onDone(); return@Thread }
+                                        // [r37] 导出走和预览同一条 16 bit 路径：全尺寸是断层最容易
+                                        // 被看见的地方（放大看天空、看灰阶过渡），降到 8 bit 再调色
+                                        // 等于把引擎算出的精度扔掉。
+                                        val fullRaw = fullFrame?.toBitmap()
+                                        if (fullRaw == null || fullFrame == null) { Diagnostics.log("export", "full 渲染失败 ${eng.lastError()}"); exportOk = false; status = "导出失败：全尺寸渲染失败"; onDone(); return@Thread }
                                         setStep(2, true, false); setStep(3, false, true)
                                         Diagnostics.log("export", "full 渲染 ${fullRaw.width}x${fullRaw.height}")
                                         // [r33] 调色必须在 HDR 封装**之前**，而且必须作用在 full 本身
@@ -2052,8 +2073,11 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                         //  · gain map 是相对 SDR 主图算的，主图先调色、增益图后生成，
                                         //    两者的色温和曲线才一致；反过来做，高光会和主图对不上；
                                         //  · EXIF 里的尺寸与指纹都取自 full，晚套一层就全错位了。
-                                        // 用的是和预览完全相同的 Layer2.apply —— 预览看到什么就导出什么。
-                                        val full = if (tone.isIdentity) fullRaw else Layer2.apply(fullRaw, tone)
+                                        // 用的是和预览完全相同的 Layer2 —— 预览看到什么就导出什么。
+                                        // [r37] 优先走 16 bit：全尺寸导出是断层最容易被看见的地方。
+                                        val full = if (tone.isIdentity) fullRaw else
+                                            (Layer2.apply16(fullFrame.px, fullFrame.w, fullFrame.h, tone)
+                                                ?: Layer2.apply(fullRaw, tone))
                                         if (!tone.isIdentity) {
                                             Diagnostics.log("export", "Layer2 已应用 ${full.width}x${full.height} " +
                                                 "色温=${"%.0f".format(tone.temp)} 对比=${"%.0f".format(tone.contrast)} " +
@@ -2105,20 +2129,22 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                             // 负片密度相同，第二帧印出来也是一片平，读不出任何新信息。
                                             // 那种片子照旧走单帧（曲线提亮），并在说明里讲清楚。
                                             var hdrFrame: Bitmap? = null
+                                            // [r37] 高光帧也留一份 16 bit，调色要和主图走同一精度
+                                            var hdrFrame16: Frame16? = null
                                             var evStep = 0.0
                                             if (photoIsRaw) {
                                                 val pe0 = printExposure
                                                 val pe1 = (pe0 * 8f).coerceIn(0.05f, 20f)
                                                 evStep = Math.log((pe1 / pe0).toDouble()) / Math.log(2.0)
                                                 if (evStep >= 1.0) {
-                                                    hdrFrame = withEngineGate(120000L, "export hdr frame") {
+                                                    hdrFrame16 = withEngineGate(120000L, "export hdr frame") {
                                                         try {
                                                             eng.setParams(sess, "{\"print_exposure\":$pe1}")
-                                                            eng.reprintToBitmap(sess, "full")
+                                                            eng.reprintFrame(sess, "full")
                                                                 ?: run {
                                                                     // 没有负片缓存（比如刚导入就导出）就退回完整渲染
                                                                     Diagnostics.log("export", "高光帧 reprint 不可用，回退完整渲染")
-                                                                    eng.renderToBitmap(sess, "full")
+                                                                    eng.renderFrame(sess, "full")
                                                                 }
                                                         } finally {
                                                             // 无论成败都要把印相曝光还回去，否则接下来的
@@ -2126,6 +2152,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                                             runCatching { eng.setParams(sess, "{\"print_exposure\":$pe0}") }
                                                         }
                                                     }
+                                                    hdrFrame = hdrFrame16?.toBitmap()
                                                     Diagnostics.log("export",
                                                         "HDR 高光帧 print_exposure $pe0→$pe1 (+${"%.2f".format(evStep)}EV) " +
                                                         "ok=${hdrFrame != null} ${hdrFrame?.let { "${it.width}x${it.height}" }}")
@@ -2139,11 +2166,25 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                             // [r33] 高光帧也要过同一套调色。它是同一张负片、同一台
                                             // 放大机印的，只是曝光多三档 —— 扫描之后的调色当然要一致。
                                             // 只调主图会让 gain map 带着未调色的色偏，HDR 一亮起来就偏色。
-                                            if (hdrFrame != null && !tone.isIdentity) {
-                                                val tinted = Layer2.apply(hdrFrame!!, tone)
-                                                if (tinted !== hdrFrame) { hdrFrame!!.recycle(); hdrFrame = tinted }
-                                                Diagnostics.log("export", "HDR 高光帧已同步调色")
+                                            if (!tone.isIdentity) {
+                                                val f16 = hdrFrame16
+                                                val tinted = if (f16 != null)
+                                                    Layer2.apply16(f16.px, f16.w, f16.h, tone) else null
+                                                if (tinted != null) {
+                                                    hdrFrame?.let { if (!it.isRecycled) it.recycle() }
+                                                    hdrFrame = tinted
+                                                    Diagnostics.log("export", "HDR 高光帧已同步调色（16 bit ${tinted.width}x${tinted.height}）")
+                                                } else if (hdrFrame != null) {
+                                                    // 16 bit 拿不到（不是 RAW、或渲染失败）时退回 8 bit：
+                                                    // 色偏必须一致，这一点比精度重要。
+                                                    val t8 = Layer2.apply(hdrFrame, tone)
+                                                    if (t8 !== hdrFrame) { hdrFrame.recycle(); hdrFrame = t8 }
+                                                    Diagnostics.log("export", "HDR 高光帧已同步调色（8 bit 回退）")
+                                                }
                                             }
+                                            // 16 bit 缓冲在 full 尺寸下是 4 字节/像素（24 MP ≈ 96 MB 的
+                                            // ShortArray），调色用完立即放掉，别留到编码阶段和新分配抢内存。
+                                            if (hdrFrame16 != null) hdrFrame16 = null
                                             runCatching {
                                                 val exif1 = Exporter.exifApp1(ctx, full,
                                                     exportMeta(full.width, full.height), srcExif,
