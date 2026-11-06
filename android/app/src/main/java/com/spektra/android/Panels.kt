@@ -544,6 +544,54 @@ fun FormatTab(
                     onValueChangeFinished = onDarkroomCommit, valueRange = 0f..3f, snapStep = 0.1f,
                     majorStep = 1f, reduceMotion = reduceMotion, default = 0f)
             }
+
+            // ===== [r33] 对比度蒙版（RFC-024）=====
+            //
+            // 这是暗房里**遮挡与加光**的自动化版本：引擎按画面结构分区改变印相曝光，
+            // 高光侧多曝、阴影侧少曝。改的是印相曝光而不是像素，所以拉高光不会连带
+            // 把云压平 —— 这是像素曲线做不到的，也是它值得从 Layer 2 里分出来的原因。
+            //
+            // 全部参数都在 PRINT 层：只重印相纸、不重冲负片。但蒙版分析本身要跑一次
+            // 高斯（上游实测 45MP 上 260–600ms，手机上只会更久），所以 scale 这类
+            // 改动只在**松手之后**才出图 —— 拖动时画面不动是预期行为，不是卡死。
+            Spacer(Modifier.height(10.dp))
+            Hairline(alpha = 0.06f)
+            Spacer(Modifier.height(4.dp))
+            SwitchRow(
+                "分区印相", darkroom.cmActive,
+                { onDarkroom(darkroom.copy(cmActive = it)); onDarkroomCommit() },
+                note = "暗房遮挡与加光 · 改印相曝光，不改像素",
+            )
+            if (darkroom.cmActive) {
+                ParamBlock("高光侧", "%.1f 档".format(darkroom.cmHighlights), note = "多曝 · 提亮亮部") {
+                    TickerSlider(value = darkroom.cmHighlights,
+                        onValueChange = { onDarkroom(darkroom.copy(cmHighlights = it)) },
+                        onValueChangeFinished = onDarkroomCommit, valueRange = 0f..3f, snapStep = 0.1f,
+                        majorStep = 1f, reduceMotion = reduceMotion, default = 0f)
+                }
+                ParamBlock("阴影侧", "%.1f 档".format(darkroom.cmShadows), note = "少曝 · 压暗暗部") {
+                    TickerSlider(value = darkroom.cmShadows,
+                        onValueChange = { onDarkroom(darkroom.copy(cmShadows = it)) },
+                        onValueChangeFinished = onDarkroomCommit, valueRange = 0f..3f, snapStep = 0.1f,
+                        majorStep = 1f, reduceMotion = reduceMotion, default = 0f)
+                }
+                ParamBlock("中间调保护", "%.1f 档".format(darkroom.cmCore), note = "0–3 · 越大越不碰中灰") {
+                    TickerSlider(value = darkroom.cmCore,
+                        onValueChange = { onDarkroom(darkroom.copy(cmCore = it)) },
+                        onValueChangeFinished = onDarkroomCommit, valueRange = 0f..3f, snapStep = 0.1f,
+                        majorStep = 1f, reduceMotion = reduceMotion, default = 1f)
+                }
+                ParamBlock("蒙版尺度", "%.3f".format(darkroom.cmScale), note = "0.002–0.12 · 长边比例") {
+                    TickerSlider(value = darkroom.cmScale.coerceIn(0.002f, 0.12f),
+                        onValueChange = { onDarkroom(darkroom.copy(cmScale = it)) },
+                        onValueChangeFinished = onDarkroomCommit, valueRange = 0.002f..0.12f,
+                        snapStep = 0.002f, majorStep = 0.02f, reduceMotion = reduceMotion, default = 0.03f)
+                }
+                Text("尺度决定分区有多粗：0.02 只压暗小片天空，0.1 会把整片天当成一个区。" +
+                    "松手后才出图 —— 每次都要重算一遍蒙版，这是全流程里最贵的一步",
+                    color = Dv.label3, fontSize = 9.5f.sp, lineHeight = 13.sp,
+                    modifier = Modifier.padding(top = 2.dp))
+            }
         }
 
         // ================= 5 · 胶片细节 =================

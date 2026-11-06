@@ -328,6 +328,19 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
     var glareAmount by remember { mutableFloatStateOf(1f) }
     var dirCouplersAmount by remember { mutableFloatStateOf(1f) }
     var halationScatter by remember { mutableFloatStateOf(1f) }
+    // ===== 对比度蒙版（r33，RFC-024）=====
+    //
+    // 这是暗房里的**遮挡（dodge）与加光（burn）**的自动化版本：引擎在印相时按画面
+    // 结构分区改变曝光，让高光侧多曝几档、阴影侧少曝几档。它改的是印相曝光，
+    // 不是像素 —— 所以拉高光不会连带把云也压平，这是像素曲线给不了的东西。
+    //
+    // 全在 PRINT 层：改一次只重印相纸，不重冲负片（见 PRINT_LAYER_KEYS）。
+    // 但 scale 变会重算一遍高斯（上游实测 45MP 上 260–600ms），所以 UI 只在松手后生效。
+    var cmActive by remember { mutableStateOf(false) }
+    var cmHighlights by remember { mutableFloatStateOf(0f) }  // 0–3 档，高光侧提亮
+    var cmShadows by remember { mutableFloatStateOf(0f) }     // 0–3 档，阴影侧压暗
+    var cmCore by remember { mutableFloatStateOf(1f) }        // 0–3 档，中间调保护带半宽
+    var cmScale by remember { mutableFloatStateOf(0.03f) }    // 0.002–0.12，蒙版空间尺度
     // ===== 几何：旋转 / 90°转 / 翻转 / 裁剪（r11，第 2 批）=====
     // 片边开启时全部锁住（上游 CropSection / RFC-032 §17.5：画面按片门比例装框，
     // 裁剪被片边占用）。这样可以保证绝不会破坏 r8 修好的片门画面。
@@ -434,7 +447,15 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         // 这一行**不能**以逗号结尾：紧接着的片边分支自己就以逗号开头，
         // 多一个逗号就成了 `1.0,,"overscan_active"`，引擎解析器读下一个 key 时报
         // "expected a string at byte N"，整帧渲染失败（r11 初版即此错，画面全黑）。
-        append("\"halation_scatter_amount\":${halationScatter}")
+        append("\"halation_scatter_amount\":${halationScatter},")
+        // [r33] 对比度蒙版插在这里（PRINT 层，紧挨其它印相参数）。关掉时把两个档数也
+        // 一起清零：引擎在 active=false 时本来就跳过整个节点，但留着旧档数会让下次
+        // 打开时"一开就跳回上次的强度"，看起来像开关自己动了。
+        append("\"contrast_mask_active\":$cmActive,")
+        append("\"contrast_mask_highlights\":${if (cmActive) cmHighlights else 0f},")
+        append("\"contrast_mask_shadows\":${if (cmActive) cmShadows else 0f},")
+        append("\"contrast_mask_core\":$cmCore,")
+        append("\"contrast_mask_scale\":$cmScale")
         // （r18 起「原色」不再改写 c/m/y 中性滤片 —— digest() 会把它们改回去，
         //   偏移量已经并进上面的 m/y_filter_shift。）
         // 片边（引擎真实 overscan）：开启时把格式/模式/seed/雾/漏光/片门/齿孔/载体交给引擎
@@ -611,6 +632,10 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         o.put("glareAmount", glareAmount.toDouble())
         o.put("dirCouplersAmount", dirCouplersAmount.toDouble())
         o.put("halationScatter", halationScatter.toDouble())
+        // [r33] 分区印相（对比度蒙版）
+        o.put("cmActive", cmActive); o.put("cmHi", cmHighlights.toDouble())
+        o.put("cmSh", cmShadows.toDouble()); o.put("cmCore", cmCore.toDouble())
+        o.put("cmScale", cmScale.toDouble())
         // 暗房放大机
         o.put("printExposure", printExposure.toDouble())
         o.put("yShift", yFilterShift.toDouble()); o.put("mShift", mFilterShift.toDouble())
@@ -658,6 +683,11 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         glareAmount = o.optDouble("glareAmount", glareAmount.toDouble()).toFloat()
         dirCouplersAmount = o.optDouble("dirCouplersAmount", dirCouplersAmount.toDouble()).toFloat()
         halationScatter = o.optDouble("halationScatter", halationScatter.toDouble()).toFloat()
+        cmActive = o.optBoolean("cmActive", cmActive)
+        cmHighlights = o.optDouble("cmHi", cmHighlights.toDouble()).toFloat()
+        cmShadows = o.optDouble("cmSh", cmShadows.toDouble()).toFloat()
+        cmCore = o.optDouble("cmCore", cmCore.toDouble()).toFloat()
+        cmScale = o.optDouble("cmScale", cmScale.toDouble()).toFloat()
 
         printExposure = o.optDouble("printExposure", printExposure.toDouble()).toFloat()
         yFilterShift = o.optDouble("yShift", yFilterShift.toDouble()).toFloat()
@@ -724,6 +754,8 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         rotationDeg = 0f; quarterTurns = 0; flipH = false; flipV = false; cropRatioIdx = 0
         printExposure = 1f; yFilterShift = 0f; mFilterShift = 0f; preflashExposure = 0f
         glareAmount = 1f; dirCouplersAmount = 1f; halationScatter = 1f
+        // [r33] 分区印相（对比度蒙版）也复位
+        cmActive = false; cmHighlights = 0f; cmShadows = 0f; cmCore = 1f; cmScale = 0.03f
         cameraFilter = ""; autoExposureMethod = "center_weighted"; lensBlurUm = 0f
         overscanActive = false; overscanFog = 1f; overscanLeaks = 0f
         overscanGate = "auto"; overscanHoles = "white"; overscanCarrier = "none"
@@ -1686,11 +1718,15 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                 exposure = printExposure, yShift = yFilterShift, mShift = mFilterShift,
                                 preflash = preflashExposure, glare = glareAmount,
                                 dirCouplers = dirCouplersAmount, halationScatter = halationScatter,
+                                cmActive = cmActive, cmHighlights = cmHighlights,
+                                cmShadows = cmShadows, cmCore = cmCore, cmScale = cmScale,
                             ),
                             onDarkroom = { d ->
                                 printExposure = d.exposure; yFilterShift = d.yShift; mFilterShift = d.mShift
                                 preflashExposure = d.preflash; glareAmount = d.glare
                                 dirCouplersAmount = d.dirCouplers; halationScatter = d.halationScatter
+                                cmActive = d.cmActive; cmHighlights = d.cmHighlights
+                                cmShadows = d.cmShadows; cmCore = d.cmCore; cmScale = d.cmScale
                             },
                             onDarkroomCommit = { renderTick++ },
                             // [r18] 「校色 / 原色」的入口在胶片页（现在是导航行右端的微型两档）；
@@ -2317,6 +2353,13 @@ data class DarkroomCfg(
     val glare: Float = 1f,           // glare_amount 1…30 的「倍数」语义：这里 0…3
     val dirCouplers: Float = 1f,     // dir_couplers_amount 0…4
     val halationScatter: Float = 1f, // halation_scatter_amount 0…1
+    // 对比度蒙版（r33）：全部是 PRINT 层，改只重印相纸。默认全是引擎默认值
+    // （active=false、两个档数=0、core=1.0、scale=0.03），不动它时出片完全不变。
+    val cmActive: Boolean = false,
+    val cmHighlights: Float = 0f,    // contrast_mask_highlights 0…3 档
+    val cmShadows: Float = 0f,       // contrast_mask_shadows 0…3 档
+    val cmCore: Float = 1f,          // contrast_mask_core 0…3 档
+    val cmScale: Float = 0.03f,      // contrast_mask_scale 0.002…0.12
 )
 
 /** 相机侧（r11 第 1 批）。滤片与测光都是 SHOOT 非 live：改一次要重冲负片。 */
@@ -2495,6 +2538,11 @@ private val PRINT_LAYER_KEYS = setOf(
     "scanner_white_correction", "scanner_black_correction", "scanner_lens_blur",
     "output_color_space", "output_cctf_encoding", "extended_dynamic_range",
     "filter_shift_scale", "preview_long_edge",
+    // [r33] 对比度蒙版全在 PRINT 层（params.cpp:108-116 标的就是 PRINT）：
+    // 它只改变印相曝光，负片一个像素都不变。漏掉这几个键的话，拖一下蒙版滑杆
+    // 会走完整渲染（重冲负片），白白多等一两秒。
+    "contrast_mask_active", "contrast_mask_highlights", "contrast_mask_shadows",
+    "contrast_mask_core", "contrast_mask_scale",
 )
 // 注意：`scan_film` **故意不在这张表里**。它虽然也是 PRINT 层字段，但引擎在
 // overscan 的布局计算里按它选「被扫描的是胶片还是相纸」（overscan.cpp:767
