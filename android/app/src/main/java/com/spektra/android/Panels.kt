@@ -560,16 +560,21 @@ fun FormatTab(
             // [r34] 打开开关时如果两个档数都是 0，先把高光侧放到 1.5 档。
             //
             // 引擎的取法是 `contrast_mask_wanted() = active && (highlights>0 || shadows>0)`，
-            // 也就是说开关本身**不改画面** —— 0 档就是原样。r33 的面板默认全 0，
-            // 于是"打开了却什么都没发生"（真机日志里还是渲染失败，见下）。
-            // 与其让用户先怀疑功能是坏的，不如让开灯就有画面：1.5 档在蒙版曲线上
-            // 于"中灰外 5 档"处正好抬 1.5 档，是肉眼能看见又不至于假的程度。
+            // 也就是说开关本身**不改画面** —— 0 档就是原样。与其让用户先怀疑功能
+            // 是坏的，不如让开灯就有画面。
+            //
+            // [r35] 这个 2 档现在真的看得见：这张相纸的中灰到纸白只有 1.8 档、到纸黑
+            // 只有 1.9 档，而旧标定要"膝点外 4 档"才达到满值（等于纸白再往外两档，
+            // 那儿的密度早就压平了），所以 1.5 档在纸白位只挪了 0.03 档 ≈ 0.002 密度，
+            // 等于没动。标定改成"膝点外 1 档"后，同一个 1.5 档在纸白是 +0.96 档
+            // （密度 0.05 → 0.28），2 档在天空这一类中高亮区也到了 +0.9 档，
+            // 是肉眼明确的"压住高光"。
             SwitchRow(
                 "分区印相", darkroom.cmActive,
                 { on ->
                     val seed = on && darkroom.cmHighlights == 0f && darkroom.cmShadows == 0f
                     onDarkroom(darkroom.copy(cmActive = on,
-                        cmHighlights = if (seed) 1.5f else darkroom.cmHighlights))
+                        cmHighlights = if (seed) 2.0f else darkroom.cmHighlights))
                     onDarkroomCommit()
                 },
                 note = "暗房遮挡与加光 · 改印相曝光，不改像素",
@@ -578,13 +583,13 @@ fun FormatTab(
                 Text("开关只是许可：两个档数都为 0 时，画面与关掉完全一样",
                     color = Dv.label3, fontSize = 9.5f.sp, lineHeight = 13.sp,
                     modifier = Modifier.padding(top = 2.dp))
-                ParamBlock("高光侧", "%.1f 档".format(darkroom.cmHighlights), note = "多曝 · 提亮亮部") {
+                ParamBlock("高光侧", "%.1f 档".format(darkroom.cmHighlights), note = "多曝 · 压住高光") {
                     TickerSlider(value = darkroom.cmHighlights,
                         onValueChange = { onDarkroom(darkroom.copy(cmHighlights = it)) },
                         onValueChangeFinished = onDarkroomCommit, valueRange = 0f..3f, snapStep = 0.1f,
                         majorStep = 1f, reduceMotion = reduceMotion, default = 0f)
                 }
-                ParamBlock("阴影侧", "%.1f 档".format(darkroom.cmShadows), note = "少曝 · 压暗暗部") {
+                ParamBlock("阴影侧", "%.1f 档".format(darkroom.cmShadows), note = "少曝 · 提亮暗部") {
                     TickerSlider(value = darkroom.cmShadows,
                         onValueChange = { onDarkroom(darkroom.copy(cmShadows = it)) },
                         onValueChangeFinished = onDarkroomCommit, valueRange = 0f..3f, snapStep = 0.1f,

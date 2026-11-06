@@ -21,9 +21,15 @@
 //   0..2  the enlarger's setup gain (image exposure only)
 //   3..5  1 / A_ref
 //   6..8  the pre-flash offset (epilogue only)
-//   9 k_lo  10 h_lo  11 lo_on    -- the print-highlight branch
-//   12 k_hi 13 h_hi  14 hi_on    -- the print-shadow branch
-//   15 the gain limit, stops
+//   9 k_lo  10 reach  11 amount/reach   -- the print-highlight branch
+//   12 k_hi 13 reach  14 amount/reach   -- the print-shadow branch
+//   15 a guard, unused by the fork's curve
+//
+// [DEYVA r35] The fork re-anchored this calibration; the host half
+// (`contrast_mask.cpp`) is shared, so this reference has to say the same
+// thing. RFC-024 read the amount four stops past the knee, where the paper is
+// already past white and the mask therefore moved nothing; the reach is now
+// one stop and `delta` holds at `amount` from there on. PORT_COVERAGE.md §7.
 #include "spk_common.h"
 
 // The floor under `log2`, relative to mid-grey: 2^-20 is ~6 densities below
@@ -57,21 +63,12 @@ inline float mask_x(float3 a, device const float* p) {
 // asymptote H.
 inline float mask_g(float d, float h) { return d * h * rsqrt(h * h + d * d); }
 
-// delta = f(b) - b, bounded. Exactly 0.0 inside the core and on a disabled
-// branch, so the gain there is exp2(0) = 1.
+// delta = f(b) - b, in stops. Exactly 0.0 inside the core and on a branch
+// whose amount is 0, so the gain there is exp2(0) = 1.
 inline float mask_delta(float b, device const float* p) {
-    float delta = 0.0f;
-    if (p[11] != 0.0f && b < p[9]) {
-        float d = p[9] - b;
-        delta = d - mask_g(d, p[10]);
-    } else if (p[14] != 0.0f && b > p[12]) {
-        float d = b - p[12];
-        delta = mask_g(d, p[13]) - d;
-    }
-    // The same smooth-min bounds the gain itself (RFC-023 §15's fix for an
-    // unbounded shadow gain): |delta| < limit for any base.
-    float lim = p[15];
-    return delta * lim * rsqrt(lim * lim + delta * delta);
+    if (p[11] != 0.0f && b < p[9]) return mask_g(p[9] - b, p[10]) * p[11];
+    if (p[14] != 0.0f && b > p[12]) return -mask_g(b - p[12], p[13]) * p[14];
+    return 0.0f;
 }
 
 // The analysis: one thread per grid cell, the mean of `x` over the cell's

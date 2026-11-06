@@ -10,9 +10,17 @@
 //   0..2  the enlarger's setup gain (image exposure only)
 //   3..5  1 / A_ref
 //   6..8  the pre-flash offset (epilogue only)
-//   9 k_lo  10 h_lo  11 lo_on    -- the print-highlight branch
-//   12 k_hi 13 h_hi  14 hi_on    -- the print-shadow branch
-//   15 the gain limit, stops
+//   9 k_lo  10 reach  11 amount/reach   -- the print-highlight branch
+//   12 k_hi 13 reach  14 amount/reach   -- the print-shadow branch
+//   15 a guard, unused by the fork's curve (see mask_delta)
+//
+// [DEYVA r35] Slots 10/11 and 13/14 used to be "room" and an on/off flag, and
+// the branch reached its amount four stops past the knee -- five from
+// mid-grey. On this app's paper that point is two stops past paper white, so
+// the highlight half moved the image by 0.03 stop: it was running and it was
+// invisible. The reach is now one stop (the paper's own edge past a one-stop
+// core) and the amount is a plain "stops at that point". See
+// PORT_COVERAGE.md §7.
 #ifndef SPK_MASK_GLSL
 #define SPK_MASK_GLSL
 
@@ -66,21 +74,19 @@ float mask_x(vec3 a) {
 // asymptote H.
 float mask_g(float d, float h) { return d * h * inversesqrt(h * h + d * d); }
 
-// delta = f(b) - b, bounded. Exactly 0.0 inside the core and on a disabled
-// branch, so the gain there is exp2(0) = 1.
+// delta = f(b) - b, in stops. Exactly 0.0 inside the core and on a branch whose
+// amount is 0, so the gain there is exp2(0) = 1.
+//
+// [DEYVA r35] `amount/reach` scales `mask_g` instead of the amount inverting a
+// gain bound four stops out: at the reach the branch reads exactly `amount`,
+// and further out it holds there rather than growing without limit. The
+// branch's own 0 is its off switch, so nothing has to keep a flag in step, and
+// no trailing bound is needed -- the curve cannot exceed `amount` by
+// construction.
 float mask_delta(float b) {
-    float delta = 0.0;
-    if (mp[11] != 0.0 && b < mp[9]) {
-        const float d = mp[9] - b;
-        delta = d - mask_g(d, mp[10]);
-    } else if (mp[14] != 0.0 && b > mp[12]) {
-        const float d = b - mp[12];
-        delta = mask_g(d, mp[13]) - d;
-    }
-    // The same smooth-min bounds the gain itself (RFC-023 §15's fix for an
-    // unbounded shadow gain): |delta| < limit for any base.
-    const float lim = mp[15];
-    return delta * lim * inversesqrt(lim * lim + delta * delta);
+    if (mp[11] != 0.0 && b < mp[9]) return mask_g(mp[9] - b, mp[10]) * mp[11];
+    if (mp[14] != 0.0 && b > mp[12]) return -mask_g(b - mp[12], mp[13]) * mp[14];
+    return 0.0;
 }
 
 #endif  // SPK_MASK_GLSL

@@ -163,8 +163,73 @@ and `local_size_x = 256`, matching the C++ argument lists and `kWorkgroup`.
 The host calibration was checked numerically against RFC-024's closed form
 (`room_for`): an amount of N stops moves a base 4 stops past the knee by
 exactly N (N = 0.5, 1, 2, 3) and leaves everything inside `core` untouched.
+That check was correct and the effect was still invisible — see §7.
 
 **Not verified:** the masked render on a real Adreno/vendor driver. This
 backend has no Metal reference to diff against off Apple, and the machine that
 built these binaries has no C++20 toolchain able to link the host (`gcc 8.1`'s
 libstdc++ has no `char8_t`), so the first on-device run is the acceptance test.
+
+---
+
+## 7. The fork's r35: why the mask ran and did nothing
+
+r34 put the mask on the wire and it ran: the device reports
+`unsupported_features: ["digital_intermediate", "scene_latitude_mapping"]`,
+every reprint succeeds, and the panel's numbers reach `spk_set_params`. The
+picture did not change. The kernel was not the problem; the **number the
+kernel was asked to compute** was.
+
+RFC-024 reads each branch's amount at `kReach = 4` stops past its knee, i.e.
+five stops from mid-grey, and fixes the curve's asymptote by inverting the
+gain bound there. On the paper this app prints on there is no density left at
+that point. Measured from `kodak_portra_endura.json` (`density_curves`,
+green channel, mid-grey taken as D = 0.745 at 18 % reflectance):
+
+| point | density | position, stops from mid-grey |
+|---|---|---|
+| paper white | 0.05 | −1.83 |
+| light grey | 0.20 | −1.08 |
+| mid-grey | 0.745 | 0 |
+| near black | 1.80 | +1.91 |
+| D-max | 2.07 | +2.4 |
+
+The print is ±2 stops wide, and the mask's untouched core is ±1, so only about
+0.8 stop at each end can move at all. `kReach = 4` puts the calibration point
+two stops past paper white. There, an amount of 1.5 buys the curve a room
+`H = 3.1`, which makes `delta` cubic near the knee:
+
+| base | plain D | RFC: Δ stops | D | fork: Δ stops | D |
+|---|---|---|---|---|---|
+| −1.30 | 0.141 | +0.001 | 0.142 | +0.431 | 0.273 |
+| −1.83 (white) | 0.050 | +0.028 | 0.052 | +0.958 | 0.271 |
+| −2.20 | 0.021 | +0.081 | 0.026 | +1.152 | 0.210 |
+| −3.00 | 0.002 | +0.319 | 0.005 | +1.342 | 0.071 |
+
+At paper white an amount of 1.5 moved the print by 0.028 stop — 0.002 density,
+two thousandths, which is a sixteenth of one 8-bit level. Even the maximum
+amount of 3 only reached +0.38 stop / D 0.11. The mask was mathematically
+incapable of moving an image, at any setting, on this paper. (The upstream
+product hides the same section behind `FeatureFlags.toneMask = false`, "there
+is still some issue behind that" — 2026-09-29. This is plausibly it.)
+
+**The change.** `kReach = 1`, and the branch is calibrated directly:
+`delta = amount/kReach * mask_g(b - knee, kReach)`. Slope 1 at the knee, and
+the branch reads exactly `amount` one stop out and holds there. Slots 10/11
+and 13/14 of the parameter block now carry `reach` and `amount/reach` (the
+amount's own 0 is the branch's off switch), the trailing smooth bound is gone
+because the curve can no longer exceed `amount`, and `room_for` is gone with
+it. Both the Metal reference and the GLSL say the same thing now.
+
+Verified with `work/mask/verify_mask.py`, which re-derives the grid, the
+truncated-window Gaussian, the bilinear sample and the paper curve, then
+prints the two tables above and renders the same photo through both
+calibrations (`work/mask/mask_calibration.png`). Formula checks: `delta` is 0
+inside the core, exactly `amount/√2` at the reach, within `±amount` everywhere,
+and has the right sign on each side. The reduce kernel's SPIR-V is unchanged
+(it never calls `mask_delta`), which is the expected fingerprint of the edit.
+
+**Still not verified:** the pixels on the device — this machine cannot link the
+host, so §6's caveat stands. What changed is that the effect is now large
+enough that "no visible change" would mean the node is not running at all,
+rather than running and computing nothing.

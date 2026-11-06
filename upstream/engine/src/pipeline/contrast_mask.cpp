@@ -57,13 +57,35 @@ constexpr uint32_t kGridMinLongEdge = 512;
 
 // Where each branch's amount is read off, in stops beyond its knee: an amount
 // of N stops means a base exposure `kReach` stops outside the core is moved N
-// stops toward it. Four stops past a one-stop core is five from mid-grey --
-// the far end of a print's useful exposure range, where the mask matters.
-constexpr double kReach = 4.0;
+// stops toward it, and everything further out holds at N.
+//
+// [DEYVA r35] RFC-024 calibrated that point at four stops past the knee, i.e.
+// five from mid-grey. On the paper this app prints on there is no density
+// left out there: kodak_portra_endura reaches paper white 1.8 stops below
+// mid-grey and paper black 1.9 stops above (`density_curves`: D = 0.05 at
+// log10 E = -0.45, D = 2.0 at +1.01, mid-grey D = 0.745 at +0.09). So with the
+// RFC's reach the highlight branch could only move tones that were already
+// clipped -- at paper white an amount of 1.5 stopped the print by 0.028 stop,
+// i.e. 0.002 density, and even an amount of 3 by only 0.38 stop. That is why
+// the mask looked like it did nothing: it ran, and it computed a number, and
+// the number was nothing on paper. Measured numbers and the arithmetic are in
+// PORT_COVERAGE.md §7.
+//
+// The reach is therefore one stop: the distance from a one-stop core to the
+// paper's own edge, which is where a darkroom printer's dodge and burn
+// actually happen.
+constexpr double kReach = 1.0;
 
-// The gain limit, in stops, as a smooth bound (RFC-023 §15's fix). The amount
-// calibration below inverts it, so N stops at the reach is still N.
-constexpr double kGainLimit = 6.0;
+// RFC-023 §15's smooth bound on the gain, in stops. The fork's curve can no
+// longer run away -- it holds at `amount` by construction -- so this only
+// guards the arithmetic; `p[15]` stays in the parameter block for the reader
+// who compares it with the RFC.
+constexpr double kGainGuard = 6.0;
+
+// RFC-023's m = 2 branch, `D * H / sqrt(H^2 + D^2)`: slope 1 at the knee,
+// asymptote H. Shared by the host's field dump and the kernels (spk_mask.glsl
+// spells the same function `mask_g`).
+double mask_g(double d, double h) { return d * h / std::sqrt(h * h + d * d); }
 
 // The guided filter's edge threshold: a base variance of (0.5 stop)^2 inside
 // the window is where the filter starts treating structure as edge rather
@@ -143,16 +165,11 @@ void gaussian(const std::vector<double>& in, std::vector<double>& out, uint32_t 
     pass(tmp, out, false);
 }
 
-// The branch's room `H` such that, after the gain bound, a base `kReach` stops
-// past the knee moves by exactly `amount` stops. Closed form both ways:
-// invert the bound (`g_2` with asymptote `kGainLimit`), then solve
-// `g_2(kReach, H) = kReach - delta` for `H`.
-double room_for(double amount) {
-    const double L = kGainLimit, R = kReach;
-    const double delta = amount * L / std::sqrt(L * L - amount * amount);
-    const double t = std::max(R - delta, 1e-3);   // delta >= R would need H <= 0
-    return R * t / std::sqrt(R * R - t * t);
-}
+// [DEYVA r35] RFC-024's `room_for` solved a curve whose asymptote was the gain
+// limit, so the branch only reached `amount` out where the paper is already
+// clipped (see `kReach`). The fork's curve holds at `amount` on its own, so the
+// only inversion left is the trivial one: the kernel is handed `amount/kReach`
+// and reads back exactly `amount` at the reach.
 
 }  // namespace
 
@@ -196,13 +213,18 @@ bool Pipeline::prepare_contrast_mask(const Image& cmy, std::string& error,
     }
 
     const double k_lo = -m.core, k_hi = m.core;
+    // [DEYVA r35] `p[10]`/`p[13]` are the reach, `p[11]`/`p[14]` are the
+    // amount divided by it (the kernel multiplies `mask_g(d, reach)` by that
+    // number, so the branch reads `amount` at the reach and holds from there).
+    // 0 in the amount slot is the branch's own off switch, which is what the
+    // kernel tests -- there is no separate flag to keep in step.
     const float p[16] = {
         float(print_gain_[0]), float(print_gain_[1]), float(print_gain_[2]),
         float(1.0 / a_ref[0]), float(1.0 / a_ref[1]), float(1.0 / a_ref[2]),
         float(print_offset_[0]), float(print_offset_[1]), float(print_offset_[2]),
-        float(k_lo), float(m.highlights > 0.0 ? room_for(m.highlights) : 1.0), m.highlights > 0.0 ? 1.0f : 0.0f,
-        float(k_hi), float(m.shadows > 0.0 ? room_for(m.shadows) : 1.0), m.shadows > 0.0 ? 1.0f : 0.0f,
-        float(kGainLimit)};
+        float(k_lo), float(kReach), m.highlights > 0.0 ? float(m.highlights / kReach) : 0.0f,
+        float(k_hi), float(kReach), m.shadows > 0.0 ? float(m.shadows / kReach) : 0.0f,
+        float(kGainGuard)};
     std::memcpy(mask_params_, p, sizeof p);
 
     // --- the grid ------------------------------------------------------------
@@ -273,15 +295,16 @@ bool Pipeline::prepare_contrast_mask(const Image& cmy, std::string& error,
     mask_gw_ = gw; mask_gh_ = gh; mask_frame_w_ = W; mask_frame_h_ = H;
     mask_on_ = true;
 
-    // The field at the grid's own cells: RFC-024's delta, in stops, after the
-    // gain bound -- what `spk_contrast_mask_field` hands the canvas, and the
-    // third plane of the research dump. Computed only when someone asks.
+    // The field at the grid's own cells: the delta, in stops, that the kernel
+    // will apply there -- what `spk_contrast_mask_field` hands the canvas, and
+    // the third plane of the research dump. Computed only when someone asks.
+    // [DEYVA r35] Same expression as `mask_delta` in spk_mask.glsl, so the
+    // field and the pixels cannot drift apart.
     auto delta_at = [&](size_t i) {
         const double bb = a[i] * x[i] + b[i];
-        double d = 0.0;
-        if (p[11] != 0.0f && bb < k_lo) { const double D = k_lo - bb; d = D - D * p[10] / std::sqrt(double(p[10]) * p[10] + D * D); }
-        else if (p[14] != 0.0f && bb > k_hi) { const double D = bb - k_hi; d = D * p[13] / std::sqrt(double(p[13]) * p[13] + D * D) - D; }
-        return float(d * kGainLimit / std::sqrt(kGainLimit * kGainLimit + d * d));
+        if (p[11] != 0.0f && bb < k_lo) return float(mask_g(k_lo - bb, kReach) * double(p[11]));
+        if (p[14] != 0.0f && bb > k_hi) return float(-mask_g(bb - k_hi, kReach) * double(p[14]));
+        return 0.0f;
     };
     if (delta_out) {
         delta_out->resize(x.size());
