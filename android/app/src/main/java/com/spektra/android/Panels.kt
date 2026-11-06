@@ -557,12 +557,27 @@ fun FormatTab(
             Spacer(Modifier.height(10.dp))
             Hairline(alpha = 0.06f)
             Spacer(Modifier.height(4.dp))
+            // [r34] 打开开关时如果两个档数都是 0，先把高光侧放到 1.5 档。
+            //
+            // 引擎的取法是 `contrast_mask_wanted() = active && (highlights>0 || shadows>0)`，
+            // 也就是说开关本身**不改画面** —— 0 档就是原样。r33 的面板默认全 0，
+            // 于是"打开了却什么都没发生"（真机日志里还是渲染失败，见下）。
+            // 与其让用户先怀疑功能是坏的，不如让开灯就有画面：1.5 档在蒙版曲线上
+            // 于"中灰外 5 档"处正好抬 1.5 档，是肉眼能看见又不至于假的程度。
             SwitchRow(
                 "分区印相", darkroom.cmActive,
-                { onDarkroom(darkroom.copy(cmActive = it)); onDarkroomCommit() },
+                { on ->
+                    val seed = on && darkroom.cmHighlights == 0f && darkroom.cmShadows == 0f
+                    onDarkroom(darkroom.copy(cmActive = on,
+                        cmHighlights = if (seed) 1.5f else darkroom.cmHighlights))
+                    onDarkroomCommit()
+                },
                 note = "暗房遮挡与加光 · 改印相曝光，不改像素",
             )
             if (darkroom.cmActive) {
+                Text("开关只是许可：两个档数都为 0 时，画面与关掉完全一样",
+                    color = Dv.label3, fontSize = 9.5f.sp, lineHeight = 13.sp,
+                    modifier = Modifier.padding(top = 2.dp))
                 ParamBlock("高光侧", "%.1f 档".format(darkroom.cmHighlights), note = "多曝 · 提亮亮部") {
                     TickerSlider(value = darkroom.cmHighlights,
                         onValueChange = { onDarkroom(darkroom.copy(cmHighlights = it)) },

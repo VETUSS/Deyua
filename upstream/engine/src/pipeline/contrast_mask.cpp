@@ -34,7 +34,11 @@
 #include <cstdlib>
 #include <cstring>
 
+#ifdef __APPLE__
 #include <dispatch/dispatch.h>
+#else
+#include "parallel_for.hpp"
+#endif
 
 #include "pipeline.hpp"
 
@@ -92,17 +96,23 @@ void box(const std::vector<double>& in, std::vector<double>& out, uint32_t w, ui
     box_1d(tmp, out, w, h, r, false);
 }
 
-// `fn(line)` for every line, across the cores. Each line writes only its own
-// outputs and reads only shared inputs, and each output is still accumulated
-// in the same order by one thread -- so the result is bit-identical to the
-// serial loop; only the wall time changes. Measured on a 45 MP frame at the
-// live tier: the serial Gaussian was ~260 ms of a 275 ms reprint at scale
-// 0.03 and ~600 of 631 at 0.093.
+// [DEYVA r34, Android the Vulkan port] The body is the same work on every
+// platform; only the work-stealing differs. macOS keeps GCD because that is
+// what this file was measured with: on a 45 MP frame at the live tier the
+// serial Gaussian was ~260 ms of a 275 ms reprint at scale 0.03 and ~600 of
+// 631 at 0.093. Every other backend uses `parallel_for_lines` -- a static
+// worker pool over std::thread handing out line indices through an atomic
+// counter. Both give each line to exactly one thread and leave the arithmetic
+// order alone, so the grid is bit-identical to the serial loop either way.
 template <class F>
 void for_each_line(uint32_t lines, F&& fn) {
+#ifdef __APPLE__
     struct Ctx { F* fn; } ctx{&fn};
     dispatch_apply_f(lines, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &ctx,
                      [](void* c, size_t line) { (*static_cast<Ctx*>(c)->fn)(uint32_t(line)); });
+#else
+    parallel_for_lines(lines, [&](uint32_t line) { fn(line); });
+#endif
 }
 
 void gaussian(const std::vector<double>& in, std::vector<double>& out, uint32_t w, uint32_t h,

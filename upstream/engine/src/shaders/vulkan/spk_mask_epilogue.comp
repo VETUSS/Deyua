@@ -1,0 +1,59 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// spk_mask_epilogue.comp -- GLSL translation of `spk_mask_epilogue` in
+// contrast_mask.metal (RFC-024 §4, §7.2).
+//
+// What `print_spectral` dispatches *instead of* `spk_spectral_epilogue` when
+// the mask is on: that kernel's spectral integral with one change in the
+// epilogue -- the image exposure is multiplied by the mask's gain **before**
+// the pre-flash offset is added.
+//
+//     unmasked:  E = max(a * gain + flash, 0) + 1e-10
+//     masked:    E = max(2^delta * (a * gain) + flash, 0) + 1e-10
+//
+// Output is log10 density in all three channels, as the enlarger node's
+// `log_out = true` requires.
+//
+// `row0` is the band's first row in the frame, so a strip reads the field at
+// the frame's coordinates and a striped render samples exactly what the
+// whole-frame one does.
+layout(local_size_x = 256) in;
+
+#include "spk_mask.glsl"
+
+layout(std430, binding = 5) readonly buffer Coef { float coef[]; };
+layout(std430, binding = 6) readonly buffer Meta { uint meta[]; };
+layout(std430, binding = 7) writeonly buffer Out { float mask_out[]; };
+
+void main() {
+    const uint i = spk_global_index();
+    const uint n = meta[0], nl = meta[1], W = meta[2], H = meta[3], row0 = meta[4];
+    const uint gw = meta[5], gh = meta[6];
+    if (i >= n) return;
+    const vec3 a = mask_image_exposure(i, nl);
+
+    // The base is `a * x + b` with `(a, b)` sampled bilinearly from the grid.
+    const uint px = i % W, py = row0 + i / W;
+    const float u = clamp((float(px) + 0.5) * float(gw) / float(W) - 0.5, 0.0, float(gw - 1u));
+    const float v = clamp((float(py) + 0.5) * float(gh) / float(H) - 0.5, 0.0, float(gh - 1u));
+    const uint u0 = uint(floor(u)), v0 = uint(floor(v));
+    const uint u1 = min(u0 + 1u, gw - 1u), v1 = min(v0 + 1u, gh - 1u);
+    const float tu = u - float(u0), tv = v - float(v0);
+    const uint i00 = 2u * (v0 * gw + u0), i01 = 2u * (v0 * gw + u1);
+    const uint i10 = 2u * (v1 * gw + u0), i11 = 2u * (v1 * gw + u1);
+    const vec2 c00 = vec2(coef[i00], coef[i00 + 1u]);
+    const vec2 c01 = vec2(coef[i01], coef[i01 + 1u]);
+    const vec2 c10 = vec2(coef[i10], coef[i10 + 1u]);
+    const vec2 c11 = vec2(coef[i11], coef[i11 + 1u]);
+    const vec2 ab = mix(mix(c00, c01, tu), mix(c10, c11, tu), tv);
+
+    const float b = ab.x * mask_x(a) + ab.y;
+    const float k = exp2(mask_delta(b));
+    const float e0 = max(k * a.x + mp[6], 0.0) + 1e-10;
+    const float e1 = max(k * a.y + mp[7], 0.0) + 1e-10;
+    const float e2 = max(k * a.z + mp[8], 0.0) + 1e-10;
+    // log10(x) = log(x) * 0.434..., the same spelling spk_spectral_epilogue uses.
+    mask_out[3u * i] = log(e0) * 0.4342944819032518;
+    mask_out[3u * i + 1u] = log(e1) * 0.4342944819032518;
+    mask_out[3u * i + 2u] = log(e2) * 0.4342944819032518;
+}

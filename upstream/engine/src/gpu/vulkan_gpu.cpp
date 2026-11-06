@@ -96,6 +96,12 @@ constexpr KernelSpec kKernels[] = {
     {"spk_overscan_add_mask", 4, kWorkgroup},
     {"spk_overscan_film_present", 4, kWorkgroup},
     {"spk_overscan_light", 4, kWorkgroup},
+    // [DEYVA r34] The contrast mask (RFC-024), translated from
+    // contrast_mask.metal. reduce binds 7: cmy, chd, base, ixs, params, meta,
+    // grid-out. epilogue binds 8: the same first five, then the bilinear
+    // coefficient grid, meta, and the band's output.
+    {"spk_mask_reduce", 7, kWorkgroup},
+    {"spk_mask_epilogue", 8, kWorkgroup},
 };
 
 const KernelSpec* find_kernel(const char* name) {

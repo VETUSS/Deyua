@@ -51,8 +51,13 @@ if(APPLE)
     target_sources(spektralab_pipeline PRIVATE
         src/pipeline/contrast_mask.cpp src/pipeline/overscan.cpp)
 else()
+    # [DEYVA r34] contrast_mask.cpp is portable now that its only Apple
+    # dependency (GCD's dispatch_apply_f) has a std::thread fallback in
+    # parallel_for.hpp, and its two kernels exist in GLSL below. Keeping it in
+    # both branches is deliberate: the one file is the whole mask, so the
+    # Vulkan and Metal renders run the same host arithmetic.
     target_sources(spektralab_pipeline PRIVATE
-        src/pipeline/windows_unported.cpp src/pipeline/overscan_port.cpp)
+        src/pipeline/overscan_port.cpp src/pipeline/contrast_mask.cpp)
 endif()
 target_link_libraries(spektralab_pipeline PRIVATE spektralab_core)
 target_include_directories(spektralab_pipeline PRIVATE
@@ -118,6 +123,7 @@ if(NOT APPLE)
             spk_lut3d_trilinear spk_di_normalise
             spk_overscan_canvas spk_overscan_add_mask
             spk_overscan_film_present spk_overscan_light
+            spk_mask_reduce spk_mask_epilogue
             CACHE INTERNAL "")
         set(vulkan_spirv)
         file(GLOB vulkan_includes "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/vulkan/*.glsl")

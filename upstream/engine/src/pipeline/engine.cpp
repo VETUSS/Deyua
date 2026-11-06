@@ -329,9 +329,11 @@ struct spk_engine {
 #ifndef __APPLE__
         // These upstream effects still require kernels or Apple services that
         // have not been ported. Defaults stay usable; explicit requests fail.
+        // [DEYVA r34] `contrast_mask` is no longer one of them: RFC-024's
+        // host half and its two kernels are in this build (see
+        // windows_unported.hpp), so the mask is a real, working effect.
         Json unported = Json::array();
-        for (const char* feature : {"digital_intermediate", "scene_latitude_mapping",
-                                    "contrast_mask"})
+        for (const char* feature : {"digital_intermediate", "scene_latitude_mapping"})
             unported.push(Json(std::string(feature)));
         backend.set("unsupported_features", std::move(unported));
 #endif
@@ -1661,7 +1663,7 @@ spk_status spk_render_digital_intermediate(spk_session* session, spk_result* out
     std::memset(out, 0, sizeof *out);
 #ifndef __APPLE__
     if (out_json) *out_json = nullptr;
-    g_error = windows_unported_error(true, false, false);
+    g_error = windows_unported_error(true, false);
     return SPK_ERR_USER;
 #endif
     if (session->params.film.info.is_positive()) {

@@ -61,7 +61,7 @@ commits.
 | section | fields | Windows_Port | Now |
 |---|---|---|---|
 | §1–§10 core render, tiers, reprint, live-mutable set | every field in `params_schema` predating RFC-024 | implemented; whole-image Metal parity unverified | same |
-| §11 contrast mask (RFC-024) | `contrast_mask_{active,highlights,shadows,core,scale,scheme}` | **refused** when `active` | refused |
+| §11 contrast mask (RFC-024) | `contrast_mask_{active,highlights,shadows,core,scale,scheme}` | **refused** when `active` | implemented (Deyva fork, r34 — see §6) |
 | §12 Scene Latitude (RFC-023) | `scene_latitude_{active,norm,shadow_knee,highlight_knee,shadow_room,highlight_room,max_lift,rolloff}` | **refused** when `active` (analysis call works) | refused |
 | §13 overscan / film edge (RFC-031/032) | `overscan_{active,mode,format,gate,holes,carrier,edge_text,frame_number,frame_seed,camera_seed,f_number,fog,leaks,pair}` | **refused** when `active` | refused |
 | §13 date back | `date_imprint_{active,text,text_b,data_text,style,corner,placement,size,ev,inset_x,inset_y}` | **refused** when `active` | refused |
@@ -86,7 +86,7 @@ commits.
 | `spk_cam16ucs_compress` | same | tested | tested |
 | `spk_grain_layers`, `spk_grain_simple`, `spk_lognormal_field`, `spk_grain_layer_one` | same (+ `spk_rng_probe`) | tested | tested (`spk_vulkan_grain`) |
 | `spk_di_encode` (Cineon DI) | **missing** | refused | refused |
-| `spk_mask_reduce`, `spk_mask_epilogue` (contrast mask) | **missing** | refused | refused |
+| `spk_mask_reduce`, `spk_mask_epilogue` (contrast mask) | **missing** | refused | implemented in the Deyva fork (§6); `src/shaders/vulkan/spk_mask*.comp` |
 | `spk_scene_latitude` | **missing** | refused | refused |
 | `spk_overscan_canvas`, `spk_overscan_add_mask`, `spk_overscan_film_present`, `spk_overscan_light` | **missing** | refused | refused |
 
@@ -141,3 +141,30 @@ Not verified: any real GPU on Linux, real Windows (only wine), Intel/AMD
 drivers, whole-image parity against Metal (needs a Mac; see PORT_PLAN §0),
 cameras beyond one NEF and one CR2 (raw.pixls.us is blocked by this
 environment's proxy).
+
+---
+
+## 6. The Deyva (Android) fork, r34: contrast mask ported
+
+RFC-024's contrast mask is no longer refused on Vulkan. The port followed
+`PORT_PLAN.md`'s own recipe for it:
+
+| piece | where | note |
+|---|---|---|
+| host half | `src/pipeline/contrast_mask.cpp` | now compiled on both branches; its one Apple dependency (GCD's `dispatch_apply_f`) is behind `#ifdef __APPLE__`, with `src/pipeline/parallel_for.hpp` (`std::thread` + atomic line counter) otherwise. Same contract as the comment above `for_each_line`: one thread per line, inputs read-only, so the grid is bit-identical to the serial loop. |
+| analysis kernel | `src/shaders/vulkan/spk_mask_reduce.comp` | translation of `contrast_mask.metal:80`; 7 bindings, `spk_global_index()` |
+| application kernel | `src/shaders/vulkan/spk_mask_epilogue.comp` | translation of `contrast_mask.metal:109`, i.e. `spk_spectral_epilogue` plus the bounded gain on the image exposure before the pre-flash offset; writes log10 density like the unmasked node |
+| shared helpers | `src/shaders/vulkan/spk_mask.glsl` | `mask_image_exposure`, `mask_x`, `mask_g`, `mask_delta` and the 16-float parameter block, verbatim from the Metal |
+| refusal | `src/pipeline/windows_unported.cpp` | deleted; `spk_mask_*` no longer appear in `backend.unsupported_features` |
+
+Verified here: both kernels compile with glslang 16.6 (`-V --target-env
+vulkan1.0`); the SPIR-V declares bindings 0–6 / 0–7, set 0, one push constant
+and `local_size_x = 256`, matching the C++ argument lists and `kWorkgroup`.
+The host calibration was checked numerically against RFC-024's closed form
+(`room_for`): an amount of N stops moves a base 4 stops past the knee by
+exactly N (N = 0.5, 1, 2, 3) and leaves everything inside `core` untouched.
+
+**Not verified:** the masked render on a real Adreno/vendor driver. This
+backend has no Metal reference to diff against off Apple, and the machine that
+built these binaries has no C++20 toolchain able to link the host (`gcc 8.1`'s
+libstdc++ has no `char8_t`), so the first on-device run is the acceptance test.
