@@ -265,7 +265,8 @@ object Layer2 {
         val invCy = if (cy > 0f) 1f / cy else 0f
 
         val ctx = Args(
-            w = w, cx = cx, cy = cy, invCx = invCx, invCy = invCy,
+            w = w, srcW = w, outW = w, step = 1,
+            cx = cx, cy = cy, invCx = invCx, invCy = invCy,
             aR = lutA[0], aG = lutA[1], aB = lutA[2],
             bR = lutB[0], bG = lutB[1], bB = lutB[2],
             satK = satK, zoneMat = zoneMat, zoneOff = zoneOff,
@@ -312,11 +313,28 @@ object Layer2 {
      * 作用在 65536 级上是连续的，只有最后落到 8 bit 时才有 1 个码值的舍入，交给抖动打散。
      *
      * [px] 是 RGBA 交错的 u16，即 `nativeRender` 的原样输出（长度 w*h*4）。
+     *
+     * [step] 是**采样步长**：1 = 全分辨率（默认），2 = 隔行隔列取一个，输出只有四分之一像素。
+     * 拖动滑杆时如果上一帧算得慢，调用方会把这一轮降到 2，先保证跟手，松手后再出全图
+     * （画面会清楚一档，这正是 Lightroom 那类的做法）。降采样只影响输出尺寸，几何
+     * （暗角半径）与抖动相位都按**源坐标**算，所以半分辨率帧和全分辨率帧的位置是对齐的，
+     * 不会出现"松手一瞬间暗角挪了半格"。
+     *
+     * [cancel] 每 8 行问一次：返回 true 就立刻放弃这一帧。拖动时参数每 16 ms 变一次，
+     * 上一帧还没算完就已经过时了 —— 不主动退出的话，好几个整帧计算会叠在一起抢 CPU，
+     * 越拖越慢。返回 null 表示这一帧被放弃（调用方当作"没算出东西"，不要拿去显示）。
      */
-    fun apply16(px: ShortArray, w: Int, h: Int, c: Cfg): Bitmap? {
+    fun apply16(
+        px: ShortArray, w: Int, h: Int, c: Cfg,
+        step: Int = 1, cancel: (() -> Boolean)? = null,
+    ): Bitmap? {
         if (w <= 0 || h <= 0) return null
         if (px.size < w * h * 4) return null
         if (c.isIdentity) return null      // 没调色：调用方直接用 8 bit 原图，零成本
+
+        val st = step.coerceIn(1, 4)
+        val ow = (w + st - 1) / st
+        val oh = (h + st - 1) / st
 
         val lutA = buildToneLut(c, LUT16)
         val lutB = buildCurveLut(c, LUT16)
@@ -329,7 +347,8 @@ object Layer2 {
         val cx = (w - 1) * 0.5f
         val cy = (h - 1) * 0.5f
         val ctx = Args(
-            w = w, cx = cx, cy = cy,
+            w = ow, srcW = w, outW = ow, step = st,
+            cx = cx, cy = cy,
             invCx = if (cx > 0f) 1f / cx else 0f, invCy = if (cy > 0f) 1f / cy else 0f,
             aR = lutA[0], aG = lutA[1], aB = lutA[2],
             bR = lutB[0], bG = lutB[1], bB = lutB[2],
@@ -337,24 +356,29 @@ object Layer2 {
             vigAmt = vigAmt, vigMid2 = vigMid * vigMid, vig = vig,
         )
 
-        val dst = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val rowsPerStrip = (STRIP_PX / w).coerceIn(1, h)
-        val buf = IntArray(w * rowsPerStrip)
+        val dst = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888)
+        val rowsPerStrip = (STRIP_PX / ow).coerceIn(1, oh)
+        val buf = IntArray(ow * rowsPerStrip)
+        val aborted = java.util.concurrent.atomic.AtomicBoolean(false)
         var y = 0
-        while (y < h) {
-            val rows = minOf(rowsPerStrip, h - y)
-            runBuckets16(px, buf, y, rows, ctx)
-            dst.setPixels(buf, 0, w, 0, y, w, rows)
+        while (y < oh) {
+            val rows = minOf(rowsPerStrip, oh - y)
+            runBuckets16(px, buf, y, rows, ctx, cancel, aborted)
+            if (aborted.get()) return null      // 这一帧已过期：别交半张图出去
+            dst.setPixels(buf, 0, ow, 0, y, ow, rows)
             y += rows
         }
         return dst
     }
 
-    /** 与 [runBuckets] 同一套切分，只是源缓冲是交错的 u16。 */
-    private fun runBuckets16(px: ShortArray, out: IntArray, yBase: Int, rows: Int, c: Args) {
+    /** 与 [runBuckets] 同一套切分，只是源缓冲是交错的 u16，且可能按步长降采样。 */
+    private fun runBuckets16(
+        px: ShortArray, out: IntArray, yBase: Int, rows: Int, c: Args,
+        cancel: (() -> Boolean)?, aborted: java.util.concurrent.atomic.AtomicBoolean,
+    ) {
         val threads = Runtime.getRuntime().availableProcessors().coerceIn(1, 4)
         if (rows < 64 || threads == 1) {
-            rows16(px, out, yBase, 0, rows, c)
+            rows16(px, out, yBase, 0, rows, c, cancel, aborted)
             return
         }
         val band = (rows + threads - 1) / threads
@@ -363,7 +387,7 @@ object Layer2 {
             val r0 = ti * band
             val r1 = minOf(rows, r0 + band)
             if (r0 >= r1) break
-            val t = Thread { rows16(px, out, yBase, r0, r1, c) }
+            val t = Thread { rows16(px, out, yBase, r0, r1, c, cancel, aborted) }
             t.isDaemon = true
             t.priority = Thread.NORM_PRIORITY
             t.start()
@@ -373,22 +397,32 @@ object Layer2 {
     }
 
     /** 16 bit 版的逐行主体；步骤与顺序和 [processRows] 一一对应。 */
-    private fun rows16(px: ShortArray, out: IntArray, yBase: Int, r0: Int, r1: Int, c: Args) {
-        val w = c.w
+    private fun rows16(
+        px: ShortArray, out: IntArray, yBase: Int, r0: Int, r1: Int, c: Args,
+        cancel: (() -> Boolean)?, aborted: java.util.concurrent.atomic.AtomicBoolean,
+    ) {
+        val srcW = c.srcW
+        val outW = c.outW
+        val st = c.step
         val aR = c.aR; val aG = c.aG; val aB = c.aB
         val bR = c.bR; val bG = c.bG; val bB = c.bB
         val satK = c.satK
         val zoneMat = c.zoneMat; val zoneOff = c.zoneOff
         val bayer = BAYER8
         for (r in r0 until r1) {
-            val yAbs = yBase + r
-            val dy = (yAbs - c.cy) * c.invCy
+            // 每 8 行问一次"还要不要算"。拖动时这一帧往往已经过时，早点退出能把
+            // CPU 让给刚生成的那一帧，手感差别的来源就在这里。
+            if (cancel != null && (r and 7) == 0 && cancel()) { aborted.set(true); return }
+            val yOut = yBase + r
+            val ySrc = yOut * st                 // 源坐标：暗角半径按它算
+            val dy = (ySrc - c.cy) * c.invCy
             val dy2 = dy * dy
-            val srcBase = yAbs * w * 4
-            val rowOut = r * w
-            val brow = (yAbs and 7) shl 3
-            for (x in 0 until w) {
-                val si = srcBase + x * 4
+            val srcBase = ySrc * srcW * 4
+            val rowOut = r * outW
+            val brow = (yOut and 7) shl 3        // 抖动相位按输出坐标，降采样也保持完整 8×8
+            for (x in 0 until outW) {
+                val sx = x * st
+                val si = srcBase + sx * 4
                 // ---- 1–4 · 白平衡 / 曝光 / 对比 / 亮度 / 高光阴影 / 黑白场 ----
                 var rr = sampleAt(aR, (px[si].toInt() and 0xFFFF) * U16_TO_UNIT)
                 var gg = sampleAt(aG, (px[si + 1].toInt() and 0xFFFF) * U16_TO_UNIT)
@@ -418,7 +452,7 @@ object Layer2 {
 
                 // ---- 8 · 暗角 ----
                 if (c.vig) {
-                    val dx = (x - c.cx) * c.invCx
+                    val dx = (sx - c.cx) * c.invCx
                     val r2 = dx * dx + dy2
                     val t = ((r2 - c.vigMid2) / (1f - c.vigMid2)).coerceIn(0f, 1f)
                     val s = t * t * (3f - 2f * t)
@@ -438,7 +472,14 @@ object Layer2 {
 
     /** 一次调色运算里所有不变的量，避免在行循环里传十几个参数。 */
     private class Args(
-        val w: Int, val cx: Float, val cy: Float, val invCx: Float, val invCy: Float,
+        val w: Int,
+        /** 源图宽度（16 bit 路径降采样时与 [outW] 不同；8 bit 路径两者相等）。 */
+        val srcW: Int,
+        /** 输出宽度（每行写多少个像素）。 */
+        val outW: Int,
+        /** 采样步长；8 bit 路径恒为 1。 */
+        val step: Int,
+        val cx: Float, val cy: Float, val invCx: Float, val invCy: Float,
         val aR: FloatArray, val aG: FloatArray, val aB: FloatArray,
         val bR: FloatArray, val bG: FloatArray, val bB: FloatArray,
         val satK: Float, val zoneMat: FloatArray, val zoneOff: FloatArray,

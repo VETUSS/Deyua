@@ -253,6 +253,9 @@ fun FormatTab(
     antihalationRemoved: Boolean, onAntihalation: (Boolean) -> Unit,
     halation: Float, onHalationChange: (Float) -> Unit, onHalationCommit: () -> Unit,
     grain: Float, onGrainChange: (Float) -> Unit, onGrainCommit: () -> Unit,
+    // [r38] 负片反差（引擎的 density_curve_gamma）。属 SHOOT 层，改一次要重冲负片，
+    // 所以和「胶片曝光」一样：拖动只改数值，松手才真渲。
+    densityGamma: Float, onDensityGamma: (Float) -> Unit, onDensityGammaCommit: () -> Unit,
     overscanActive: Boolean, onOverscanActive: (Boolean) -> Unit,
     overscanFormat: String, onOverscanFormat: (String) -> Unit,
     overscanFog: Float, onOverscanFog: (Float) -> Unit, onOverscanFogCommit: () -> Unit,
@@ -617,6 +620,25 @@ fun FormatTab(
         // ================= 5 · 胶片细节 =================
         Section("胶片细节", "couplers", 5, 5 in open, ::toggle,
             trailing = { Label("%.2f×".format(darkroom.glare), color = Dv.label3, size = 9) }) {
+            // ===== [r38] 负片反差（density_curve_gamma）=====
+            //
+            // 唯一一项"引擎支持、界面没有"的功能。它和下面几项不是一回事：
+            // dir_couplers / glare / scatter 都在**印相 / 扫描**侧，这一项动的是负片
+            // 自己的密度曲线 —— 把曲线的横轴（log 曝光）按 1/gamma 缩放，形状不变、
+            // 横轴被拉伸，于是局部斜率整体除以 gamma：
+            //   gamma 越大越平（灰、宽容度大）；越小越硬（反差大，容易黑死白死）。
+            // 引擎范围 0.2…4（params.cpp:59），1.0 = 这支胶片本来的样子。
+            // 属 SHOOT 层：改一次要重冲负片，所以拖动只改读数，松手才渲。
+            ParamBlock("负片反差", "%.2f×".format(densityGamma), note = "0.2–4 · 1 = 原样，越大越平") {
+                TickerSlider(value = densityGamma.coerceIn(0.2f, 4f),
+                    onValueChange = onDensityGamma, onValueChangeFinished = onDensityGammaCommit,
+                    valueRange = 0.2f..4f, snapStep = 0.05f, majorStep = 1f,
+                    reduceMotion = reduceMotion, default = 1f)
+            }
+            Text("它拉伸的是负片密度曲线的横轴，不是像素：往小是硬调负片（黑得更快），往大是宽容度更大的软调。" +
+                "改一次要重冲负片，松手后出图",
+                color = Dv.label3, fontSize = 9.5f.sp, lineHeight = 13.sp,
+                modifier = Modifier.padding(top = 2.dp, bottom = 8.dp))
             // [r25] 量程从 0…3 放到 0…10。
             //
             // 引擎里 glare 的真实量是「叠加光占白点的比例」：percent = 0.03 × amount，

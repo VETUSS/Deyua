@@ -290,6 +290,12 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
     var photoBmp by remember { mutableStateOf<Bitmap?>(null) }
     var photoData by remember { mutableStateOf<Triple<FloatArray, Int, Int>?>(null) }
     var thumbSrc by remember { mutableStateOf<Triple<FloatArray, Int, Int>?>(null) } // 缩略图专用小尺寸源（长边 ThumbStore.SRC_EDGE），避免每次拿全尺寸 float 渲染
+    // [r38] 缩略图分两层，和主图完全同一个道理：
+    //   thumbBase  = 引擎冲洗出来的原样（这也是磁盘缓存里存的那一份）；
+    //   thumbCache = 套过 Layer 2 之后真正显示在格子里的那张。
+    // 之前只有一层，于是"调完色看胶片条还是原色"—— 用户拿它挑胶片，看到的是错的。
+    // 拆开之后调色不必重渲引擎（那要几秒），只是把已有的十几张小图重跑一遍 Layer 2。
+    var thumbBase by remember { mutableStateOf<Map<String, Bitmap>>(emptyMap()) }
     var thumbCache by remember { mutableStateOf<Map<String, Bitmap>>(emptyMap()) }
     // [r9] 当前照片的指纹：磁盘缩略图按它分文件名，换照片即失效，同一张照片重开 App 直接命中
     var thumbPhotoKey by remember { mutableStateOf("") }
@@ -332,6 +338,17 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
     var glareAmount by remember { mutableFloatStateOf(1f) }
     var dirCouplersAmount by remember { mutableFloatStateOf(1f) }
     var halationScatter by remember { mutableFloatStateOf(1f) }
+    // ===== 负片反差（r38）=====
+    //
+    // 引擎里叫 density_curve_gamma：它把负片密度曲线的**横轴**（log 曝光）按 1/gamma 缩放。
+    // 曲线形状不变、横轴被拉伸 —— 所以局部斜率整体除以 gamma：
+    //   gamma > 1 → 更平（灰、宽容度大）；gamma < 1 → 更硬（反差大、更容易黑死或白死）。
+    // 范围 0.2…4（params.cpp:59），1.0 是胶片原样。
+    //
+    // 之前 App 从来没下发过这一项：引擎支持 0.2–4，界面上却没有入口，是自查里唯一一个
+    // 「引擎有、用户碰不到」的功能。它属 SHOOT 层，改一次要重冲负片，所以和「胶片曝光」
+    // 一样只在松手后提交。
+    var densityGamma by remember { mutableFloatStateOf(1f) }
     // ===== 对比度蒙版（r33，RFC-024）=====
     //
     // 这是暗房里的**遮挡（dodge）与加光（burn）**的自动化版本：引擎在印相时按画面
@@ -448,6 +465,10 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         // 注意 halation_amount 已有独立滑杆（0…4），这里是**散射**分量，不是同一项。
         append(",\"glare_active\":true,\"glare_amount\":${glareAmount},")
         append("\"dir_couplers_active\":true,\"dir_couplers_amount\":${dirCouplersAmount},")
+        // [r38] 负片反差。放这儿是有讲究的：它必须和其它 film_render 参数一起下发，
+        // 且**默认 1.0 时不改变任何现有出片**（引擎默认就是 1）。它是 SHOOT 层，
+        // 一旦不等于 1 就会触发重冲负片 —— PRINT_LAYER_KEYS 里没有它，这正是对的。
+        append("\"density_curve_gamma\":${densityGamma},")
         // 这一行**不能**以逗号结尾：紧接着的片边分支自己就以逗号开头，
         // 多一个逗号就成了 `1.0,,"overscan_active"`，引擎解析器读下一个 key 时报
         // "expected a string at byte N"，整帧渲染失败（r11 初版即此错，画面全黑）。
@@ -636,6 +657,8 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         o.put("glareAmount", glareAmount.toDouble())
         o.put("dirCouplersAmount", dirCouplersAmount.toDouble())
         o.put("halationScatter", halationScatter.toDouble())
+        // [r38] 负片反差也在配方里：它改的是冲洗出来的反差，是最该被复刻的一项
+        o.put("densityGamma", densityGamma.toDouble())
         // [r33] 分区印相（对比度蒙版）
         o.put("cmActive", cmActive); o.put("cmHi", cmHighlights.toDouble())
         o.put("cmSh", cmShadows.toDouble()); o.put("cmCore", cmCore.toDouble())
@@ -687,6 +710,8 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         glareAmount = o.optDouble("glareAmount", glareAmount.toDouble()).toFloat()
         dirCouplersAmount = o.optDouble("dirCouplersAmount", dirCouplersAmount.toDouble()).toFloat()
         halationScatter = o.optDouble("halationScatter", halationScatter.toDouble()).toFloat()
+        // [r38] 旧配方没有这一项 → 保持 1.0（负片原样），不会被写成 0
+        densityGamma = o.optDouble("densityGamma", densityGamma.toDouble()).toFloat().coerceIn(0.2f, 4f)
         cmActive = o.optBoolean("cmActive", cmActive)
         cmHighlights = o.optDouble("cmHi", cmHighlights.toDouble()).toFloat()
         cmShadows = o.optDouble("cmSh", cmShadows.toDouble()).toFloat()
@@ -758,6 +783,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         rotationDeg = 0f; quarterTurns = 0; flipH = false; flipV = false; cropRatioIdx = 0
         printExposure = 1f; yFilterShift = 0f; mFilterShift = 0f; preflashExposure = 0f
         glareAmount = 1f; dirCouplersAmount = 1f; halationScatter = 1f
+        densityGamma = 1f
         // [r33] 分区印相（对比度蒙版）也复位
         cmActive = false; cmHighlights = 0f; cmShadows = 0f; cmCore = 1f; cmScale = 0.03f
         cameraFilter = ""; autoExposureMethod = "center_weighted"; lensBlurUm = 0f
@@ -1064,6 +1090,10 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                     val grainOn = grainAmount > 0f
                     eng.setParams(s, "{\"film_stock\":\"$fs\",\"print_stock\":\"$ps\"$hs,"
                         + inDelta
+                        // [r38] 负片反差必须带上：缩略图是"这卷片洗出来什么样"，反差不对
+                        // 就又是一处"格子里和成片不一样"。粘性 delta 不传会沿用上一组的值，
+                        // 所以每张都显式写。
+                        + "\"density_curve_gamma\":$densityGamma,"
                         // [r15] 自动曝光必须开 —— 这是"缩略图颜色全一样"的真正原因。
                         // 原来这里写 auto_exposure:false（为了省掉每张一次的测光），可引擎在
                         // 关掉 AE 时用负片的固定密度印相：每种负片都被印到同一个中灰上，
@@ -1124,26 +1154,28 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         if (pk.isNotEmpty()) {
             for (v in need) {
                 val k = if (section == 0) "${v.id}@$printId" else "$filmId@${v.id}"
-                if (thumbCache[k] != null) continue
+                if (thumbBase[k] != null) continue
                 val fs = if (section == 0) v.id else filmId
                 val ps = if (section == 0) printId else v.id
+                // [r38] 磁盘里存的是**引擎原样**（不带调色），所以命中即进 thumbBase，
+                // 再由下面的派生 effect 统一套 Layer 2。
                 ThumbStore.load(ctx, pk, fs, ps)?.let { fromDisk[k] = it }
             }
             if (fromDisk.isNotEmpty()) {
-                thumbCache = thumbCache + fromDisk
+                thumbBase = thumbBase + fromDisk
                 Diagnostics.log("thumb", "磁盘命中 ${fromDisk.size} 张（section=$section）")
             }
         }
         val missing = need.filter {
             val k = if (section == 0) "${it.id}@$printId" else "$filmId@${it.id}"
-            thumbCache[k] == null
+            thumbBase[k] == null
         }
         if (missing.isEmpty()) return
         val myReq = thumbReq
         runCatching {
             val add = renderThumbs(eng, ts, pk, filmId, printId, missing, section) { thumbReq != myReq }
             // 合并时以"渲染结果 + 已命中"为准；期间若被清空（换照片）就不再写回旧图
-            if (thumbReq == myReq) thumbCache = thumbCache + add
+            if (thumbReq == myReq) thumbBase = thumbBase + add
         }
     }
 
@@ -1185,6 +1217,9 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                     // 释放上一张照片的源数据与缩略图缓存（大 FloatArray，否则连续导入会内存累积 OOM；
                     // 不清空 thumbCache 则新照片缩略图不会重渲，仍显示上一张）。不强制 System.gc，交给系统回收避免停顿。
                     photoData = null
+                    // [r38] 两层一起清：只清显示层的话，派生 effect 会立刻用旧照片的
+                    // thumbBase 重新填回来，等于没清。
+                    thumbBase = emptyMap()
                     thumbCache = emptyMap()
                     // RAW 检测：photopicker 的 Uri 尾段只有数字无扩展名，用 DISPLAY_NAME 拿真实文件名
                     val seg = rawDisplayName(ctx, pending)
@@ -1280,6 +1315,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
     val trueColorFirst = remember { booleanArrayOf(true) }
     LaunchedEffect(filmTrueColor) {
         if (trueColorFirst[0]) { trueColorFirst[0] = false; return@LaunchedEffect }
+        thumbBase = emptyMap()
         thumbCache = emptyMap()
         thumbReq++
         // [r19] 换挡时给一句人话：这个开关只写成「校色 / 原色」两个词，不说清它改了什么，
@@ -1296,6 +1332,38 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                 runCatching { renderMissingThumbs(eng, ts, pk, section, filmVariant, printVariant) }
             }
         }
+    }
+
+    // ===== [r38] 缩略图套 Layer 2：thumbBase（引擎原样）→ thumbCache（显示用）=====
+    //
+    // 之前的取舍是"缩略图不调色，省掉十几张图的一次调色"。代价是：调完之后看胶片条，
+    // 格子里还是没调过的颜色 —— 而用户正是靠这几格挑胶片，等于给了一张错样片。
+    //
+    // 现在补齐，但不是每帧都补：几十张小图（256 长边）合起来和一张预览同量级，
+    // 每帧算一遍会和用户真正在看的主图抢 CPU。所以停手 250 ms 后才算一轮；
+    // 拖动期间 tone 一直在变，effect 不停重启，实际上不会跑。
+    // 已经按同一个 tone 算过的格子直接复用（切 tab 时只补新来的那几张）。
+    var thumbTone by remember { mutableStateOf<Layer2.Cfg?>(null) }
+    LaunchedEffect(thumbBase, tone) {
+        val baseMap = thumbBase
+        if (baseMap.isEmpty()) {
+            if (thumbCache.isNotEmpty()) thumbCache = emptyMap()
+            thumbTone = null
+            return@LaunchedEffect
+        }
+        // 没调色：直接拿引擎原样当显示图，一份内存、零计算
+        if (tone.isIdentity) { thumbCache = baseMap; thumbTone = tone; return@LaunchedEffect }
+        val prev = thumbCache
+        val prevOk = thumbTone == tone
+        if (prevOk && baseMap.keys.all { prev[it] != null }) return@LaunchedEffect
+        delay(250)
+        val conv = withContext(Dispatchers.Default) {
+            baseMap.mapValues { (k, b) ->
+                (if (prevOk) prev[k] else null) ?: Layer2.apply(b, tone)
+            }
+        }
+        thumbCache = conv
+        thumbTone = tone
     }
 
     val eng = engine
@@ -1351,27 +1419,68 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
     // delay(16) 是必要的，不是凑数 —— 拖滑杆时 onValueChange 每帧都在改 tone，
     // 没有这个下限，每次改都会起一轮全图处理，几轮叠在一起反而更卡（它们互相抢 CPU）。
     // 16 ms 刚好一帧：用户看到的是「跟手」，而不是「一卡一卡地追手」。
-    LaunchedEffect(previewBase, tone, renderRaw) {
+    // [r38] 调色耗时的实测值与「拖动期降档」。
+    //
+    // 1280 长边上一帧 apply16 大约 20–30 ms，而拖动时参数每 16 ms 变一次 —— 算得慢的
+    // 机器上会出现"上一帧还没算完，下一帧又来了"。旧代码对此只能干看着：协程被取消，
+    // 但已经跑起来的 CPU 循环不会中途停下，于是好几帧的计算叠在一起抢同一个 CPU，
+    // 越拖越顿。现在三层处理：
+    //   ① 实测每帧耗时，慢于 26 ms（不到 38 fps）就把下一帧降到半分辨率（隔行隔列），
+    //      画面糊一档但跟手；快于 12 ms 再升回全分辨率；
+    //   ② 松手（ToneTab 的 onCommit）时强制出一次全分辨率，用户最后看到的一定是清晰的；
+    //   ③ 过期帧自己在行循环里退出（apply16 的 cancel 回调），不再白算。
+    val toneMs = remember { java.util.concurrent.atomic.AtomicLong(0L) }
+    var toneFast by remember { mutableStateOf(false) }         // 拖动期降档标志
+    var toneSettle by remember { mutableIntStateOf(0) }        // 松手信号（+1 → 本轮全分辨率）
+    var toneSettleReq by remember { mutableStateOf(false) }
+    // 当前"该被算的是哪一帧"的令牌：换令牌即作废旧帧
+    val toneToken = remember { java.util.concurrent.atomic.AtomicReference<Any?>(null) }
+
+    LaunchedEffect(previewBase, tone, renderRaw, toneSettle) {
         val base = previewBase
         if (base == null) { preview = null; toneHist = null; return@LaunchedEffect }
+        // 先把令牌换成自己：上一帧如果还在算，它下一次检查就会退出。
+        // 放在 delay 之前是有意的 —— 拖动时这一轮很可能在 16 ms 内就被下一轮取代，
+        // 若等到 delay 之后才换令牌，上一帧就白白多算了一整帧。
+        val me = Any()
+        toneToken.set(me)
         delay(16)
         if (tone.isIdentity) {
             preview = base
             toneHist = withContext(Dispatchers.Default) { Layer2.histogram(base) }
+            // 回到"没调色"就等于回到了 8 bit 原图的零成本路径，降档状态要一起清掉，
+            // 否则下次刚拖第一下就出半分辨率，看着像坏了
+            toneFast = false
             return@LaunchedEffect
         }
+        // 松手那一轮强制全分辨率；其余时候沿用上一帧的实测结论
+        val forceFull = toneSettleReq
+        toneSettleReq = false
+        val step = if (toneFast && !forceFull) 2 else 1
         val raw = renderRaw
-        val r = withContext(Dispatchers.Default) {
+        val t0 = System.nanoTime()
+        val r: Pair<Bitmap, Layer2.Hist>? = withContext(Dispatchers.Default) {
             // 16 bit 优先；帧对不上（换图、渲染失败、自愈换了 session）就退回 8 bit。
             // 退回时画面仍然正确，只是大幅曲线会重新出现色阶断层 —— 宁可这样也不要
             // 拿上一张图的像素去调这一张。
-            val b = (if (raw != null && raw.w == base.width && raw.h == base.height)
-                Layer2.apply16(raw.px, raw.w, raw.h, tone) else null)
-                ?: Layer2.apply(base, tone)
+            val out = if (raw != null && raw.w == base.width && raw.h == base.height)
+                Layer2.apply16(raw.px, raw.w, raw.h, tone, step) { toneToken.get() !== me }
+            else null
+            // apply16 交白卷有两种原因：① 没有 16 bit 帧（要退回 8 bit）；② 这一帧已经
+            // 过期（被新参数取代）。后者绝不能再拿 8 bit 重算一遍 —— 那正是"越拖越卡"，
+            // 而且算出来的东西马上就要被下一帧覆盖。直接作废，画面停在上一帧。
+            if (out == null && toneToken.get() !== me) return@withContext null
+            val b = out ?: Layer2.apply(base, tone)
             b to Layer2.histogram(b)
         }
+        if (r == null) return@LaunchedEffect     // 过期帧：不更新画面，也不动降档状态
+        val ms = (System.nanoTime() - t0) / 1_000_000
+        toneMs.set(ms)
         preview = r.first
         toneHist = r.second
+        // 迟滞：慢才降、明显快了才升，避免在阈值附近来回跳（每跳一次画面清晰度都会变）
+        if (step == 1 && ms > 26) toneFast = true
+        else if (step == 2 && ms < 12) toneFast = false
     }
 
     // 预览 HDR：开关开启时把预览叠加高光恢复（与导出 gain map 同一曲线），后台计算避免卡顿
@@ -1679,11 +1788,16 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                             // 松手时打一行：调色不进引擎，所以"没反应"只可能是 Layer 2
                             // 自己出问题。这一行把当时的参数原样记下来，日志能复现。
                             onCommit = {
+                                // [r38] 松手：把这一轮钉成全分辨率（拖动期可能降到了半分辨率），
+                                // 顺便把实测耗时写进日志 —— "卡不卡"以后有数字可查，不用凭感觉。
+                                toneSettleReq = true
+                                toneSettle++
                                 if (!tone.isIdentity) {
                                     Diagnostics.log("tone", "Layer2 ${previewBase?.width}x${previewBase?.height} " +
                                         "色温=${"%.0f".format(tone.temp)} 色调=${"%.0f".format(tone.tint)} " +
                                         "曝光=${"%.2f".format(tone.exposure)} 对比=${"%.0f".format(tone.contrast)} " +
-                                        "饱和=${"%.0f".format(tone.saturation)} 暗角=${"%.0f".format(tone.vignette)}")
+                                        "饱和=${"%.0f".format(tone.saturation)} 暗角=${"%.0f".format(tone.vignette)} " +
+                                        "耗时=${toneMs.get()}ms${if (toneFast) "(拖动期降半分辨率)" else ""}")
                                 }
                             },
                             reduceMotion = reduceMotion,
@@ -1693,6 +1807,9 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                             antihalationRemoved = antihalationRemoved, onAntihalation = { antihalationRemoved = it; renderTick++ },
                             halation = halationAmount, onHalationChange = { halationAmount = it }, onHalationCommit = { renderTick++ },
                             grain = grainAmount, onGrainChange = { grainAmount = it }, onGrainCommit = { renderTick++ },
+                            // [r38] 负片反差：SHOOT 层，松手才重冲负片
+                            densityGamma = densityGamma, onDensityGamma = { densityGamma = it },
+                            onDensityGammaCommit = { renderTick++ },
                             overscanActive = overscanActive, onOverscanActive = { on ->
                                 // 开启片边时按当前照片比例自动匹配最接近的 gate 格式，避免照片被大量裁切破坏画面
                                 if (on) { overscanFormat = osBestFormat(sourceW, sourceH); forceNoOverscan = false }
