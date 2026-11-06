@@ -39,7 +39,7 @@ profile 与 LUT 是 CC BY-SA 4.0 授权的开放数据：使用与再分发须�
 ### 步骤
 
 ```bash
-git clone https://github.com/<你的用户名>/Deyva.git
+git clone https://github.com/VETUSS/Deyua.git
 cd Deyva
 
 # 1. 获取 LibRaw 0.22.2 源码（约 20 MB，需联网；落点 upstream/build/deps）

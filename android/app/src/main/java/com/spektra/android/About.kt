@@ -63,7 +63,7 @@ object BuildIntegrity {
     const val OFFICIAL_CERT_SHA256 = "bd5b1581425b953da52ab9550bf5149c52c30277a36d8358443cb0fa358c8236"
 
     /** 源码获取地址。发布前必须填写 —— GPL-3.0 第 6 条要求随目标代码提供对应源码。 */
-    const val SOURCE_URL = ""
+    const val SOURCE_URL = "https://github.com/VETUSS/Deyua"
 
     enum class State { OFFICIAL, UNOFFICIAL, DEV }
 
