@@ -224,7 +224,7 @@ it. Both the Metal reference and the GLSL say the same thing now.
 Verified with `work/mask/verify_mask.py`, which re-derives the grid, the
 truncated-window Gaussian, the bilinear sample and the paper curve, then
 prints the two tables above and renders the same photo through both
-calibrations (`work/mask/mask_calibration.png`). Formula checks: `delta` is 0
+calibrations (`work/mask/mask_calibration.jpg`). Formula checks: `delta` is 0
 inside the core, exactly `amount/√2` at the reach, within `±amount` everywhere,
 and has the right sign on each side. The reduce kernel's SPIR-V is unchanged
 (it never calls `mask_delta`), which is the expected fingerprint of the edit.
