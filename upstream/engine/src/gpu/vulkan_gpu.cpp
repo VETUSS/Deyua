@@ -502,13 +502,9 @@ public:
         if (!bytes || (dst == src && dst_offset == src_offset)) return true;
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
         const auto start = diagnostic_start();
-        if (!submit_sync([&](VkCommandBuffer command) {
-                device_barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-                VkBufferCopy range{VkDeviceSize(src_offset), VkDeviceSize(dst_offset), VkDeviceSize(bytes)};
-                vkCmdCopyBuffer(command, src->handle, dst->handle, 1, &range);
-                transfer_written(command);
-            }, "Vulkan device copy", error)) return false;
+        if (!copy_chunked_sync(src->handle, VkDeviceSize(src_offset), dst->handle,
+                               VkDeviceSize(dst_offset), VkDeviceSize(bytes),
+                               "Vulkan device copy", error)) return false;
         transfer_timing("copy", bytes, start);
         return true;
     }
@@ -520,11 +516,11 @@ public:
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
         const auto start = diagnostic_start();
         if (!ensure_staging(read_staging_, bytes, true, error)) return false;
+        if (!copy_chunked_sync(src->handle, VkDeviceSize(src_offset), read_staging_.handle, 0,
+                               VkDeviceSize(bytes), "Vulkan host readback", error)) return false;
         if (!submit_sync([&](VkCommandBuffer command) {
                 device_barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-                VkBufferCopy range{VkDeviceSize(src_offset), 0, VkDeviceSize(bytes)};
-                vkCmdCopyBuffer(command, src->handle, read_staging_.handle, 1, &range);
                 VkBufferMemoryBarrier barrier{};
                 barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
                 barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -678,8 +674,14 @@ public:
                 else vkCmdDispatch(command, first_groups, 1, 1);
             };
             if (!chunk_safe) {
+                // [r40.4] Name the kernel in the failure. `VkResult -4` on its
+                // own says the device went away but not *where*, and an export
+                // that dies at 2.9 s of a 33 s render is a different bug from
+                // one that dies at the end.
+                const std::string op = std::string("Vulkan compute dispatch ") +
+                                       (kernel ? kernel : "?");
                 return submit_sync([&](VkCommandBuffer command) { record(command, 0u, 0u); },
-                                   "Vulkan compute dispatch", error);
+                                   op.c_str(), error);
             }
             // One submit per chunk: this driver applies a command buffer's
             // push constants as submit-time state, so back-to-back chunks would
@@ -697,8 +699,11 @@ public:
                     return false;
                 }
                 const uint32_t base = uint32_t(base64);
+                char op[192];
+                std::snprintf(op, sizeof op, "Vulkan compute dispatch %s [chunk %zu/%zu of %zu pg]",
+                              kernel ? kernel : "?", chunk + 1, chunks, groups);
                 ok = submit_sync([&](VkCommandBuffer command) { record(command, this_groups, base); },
-                                 "Vulkan compute dispatch", error);
+                                 op, error);
             }
             return ok;
         }();
@@ -729,6 +734,16 @@ public:
     uint32_t texture_row_alignment_px() const override { return 1; }
     uint32_t max_texture_dimension_2d() const override {
         return properties_.limits.maxImageDimension2D;
+    }
+    // [DEYVA r40] The one number that decides whether a frame can render at all:
+    // a single SSBO larger than this is refused by `dispatch` (see the check at
+    // the top of it), and a plane is `w * h * 3 * 4` bytes. The caller uses it
+    // to choose a working long edge *before* opening a session, because the
+    // failure mode is not a slow render -- it is a device reset on some Adreno
+    // parts. Read after the CPU-probe adjustment above, so it is the range this
+    // device actually accepted, not the one it advertised.
+    uint64_t storage_range_limit() const override {
+        return static_cast<uint64_t>(storage_range_limit_);
     }
 
     PoolStats pool_stats() const override {
@@ -840,6 +855,42 @@ private:
         barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    }
+
+    // [DEYVA-FIX v0.8.99] Adreno 830 executes only part of one large
+    // `vkCmdCopyBuffer`, and says nothing when it does.
+    //
+    // This is the same failure the dispatch path has been working around since
+    // v0.8.90, one layer down, and it is the one that reached a photograph: a
+    // 196 MB host readback came back with a band of rows written and the rest
+    // still holding the *previous* readback's bytes, so an export showed one
+    // scene in two print stocks split by a hard horizontal line, with the rows
+    // nobody had touched yet left black. The 295 MB negative cache copy had the
+    // same shape. v0.8.86 already recorded a 14.7 MB staging copy losing its
+    // right half; nothing above that size was ever proven good.
+    //
+    // So no single copy command is larger than this, and each one is its own
+    // submit -- the dispatch loop's shape, which is the one this driver has been
+    // seen to honour. The extra submits cost tens of milliseconds against a
+    // thirty-second full-tier render.
+    static constexpr VkDeviceSize kCopyChunkBytes = VkDeviceSize(2) << 20;
+
+    bool copy_chunked_sync(VkBuffer src, VkDeviceSize src_offset, VkBuffer dst,
+                           VkDeviceSize dst_offset, VkDeviceSize bytes,
+                           const char* operation, std::string& error) {
+        for (VkDeviceSize at = 0; at < bytes; at += kCopyChunkBytes) {
+            const VkDeviceSize n = std::min<VkDeviceSize>(kCopyChunkBytes, bytes - at);
+            const VkDeviceSize from = src_offset + at;
+            const VkDeviceSize to = dst_offset + at;
+            if (!submit_sync([&](VkCommandBuffer command) {
+                    device_barrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                    VkBufferCopy range{from, to, n};
+                    vkCmdCopyBuffer(command, src, dst, 1, &range);
+                    transfer_written(command);
+                }, operation, error)) return false;
+        }
+        return true;
     }
 
     bool ensure_staging(Buffer& staging, size_t bytes, bool readback, std::string& error) {

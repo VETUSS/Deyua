@@ -144,7 +144,7 @@ fun <T> livelySpec(reduce: Boolean): AnimationSpec<T> =
  * 混在真图标里一眼就"不是系统画的"。这里用 Canvas 按 24dp 网格画三枚，线宽统一 1.7dp、
  * 圆角端点，和系统 SF Symbols 的观感一致（也方便以后换色/换尺寸）。
  */
-enum class Glyph { Undo, More, Copy, Plus, Grid, Pulse, Close }
+enum class Glyph { Undo, More, Copy, Plus, Grid, Pulse, Close, Document }
 
 @Composable
 fun GlyphIcon(glyph: Glyph, tint: Color = Color.White, box: androidx.compose.ui.unit.Dp = 22.dp) {
@@ -226,6 +226,37 @@ fun GlyphIcon(glyph: Glyph, tint: Color = Color.White, box: androidx.compose.ui.
                 }
             }
             // [r14] 关闭：两条对角交叉线（交叉点留 1px 空隙，避免圆头叠出一个小疙瘩）
+            Glyph.Document -> {
+                // 一张折角纸：轮廓 + 折角的斜边收口 + 两行内容线。
+                // 纸的右边缘停在折角处，折角自己走一条斜线，才不像「缺了一角的矩形」。
+                val w = s * 0.52f
+                val h = s * 0.66f
+                val fold = s * 0.18f
+                val left = c.x - w * 0.5f
+                val top = c.y - h * 0.5f
+                val right = left + w
+                val bottom = top + h
+                val foldX = right - fold
+                val foldY = top + fold
+                drawPath(Path().apply {
+                    moveTo(left, top)
+                    lineTo(foldX, top)
+                    lineTo(right, foldY)
+                    lineTo(right, bottom)
+                    lineTo(left, bottom)
+                    close()
+                }, tint, style = Stroke(width = stroke, join = StrokeJoin.Round))
+                drawPath(Path().apply {
+                    moveTo(foldX, top)
+                    lineTo(foldX, foldY)
+                    lineTo(right, foldY)
+                }, tint, style = Stroke(width = stroke * 0.8f, join = StrokeJoin.Round))
+                val lx = left + w * 0.2f
+                drawLine(tint, Offset(lx, top + h * 0.56f), Offset(right - w * 0.2f, top + h * 0.56f),
+                    strokeWidth = stroke * 0.85f, cap = StrokeCap.Round)
+                drawLine(tint, Offset(lx, top + h * 0.76f), Offset(right - w * 0.38f, top + h * 0.76f),
+                    strokeWidth = stroke * 0.85f, cap = StrokeCap.Round)
+            }
             Glyph.Close -> {
                 val r = s * 0.24f
                 drawLine(tint, Offset(c.x - r, c.y - r), Offset(c.x - r * 0.12f, c.y - r * 0.12f),

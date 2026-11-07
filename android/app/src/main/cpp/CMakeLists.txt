@@ -37,6 +37,18 @@ add_library(jni_raw SHARED
     jni_raw.cpp
     "${UPSTREAM}/engine/src/io/raw_decoder.cpp"
     "${UPSTREAM}/engine/src/io/raw_headroom.cpp")
-target_include_directories(jni_raw PRIVATE "${UPSTREAM}/engine/src")
+target_include_directories(jni_raw PRIVATE "${UPSTREAM}/engine/src" ${UPSTREAM_INCLUDE})
 target_compile_features(jni_raw PUBLIC cxx_std_20)
-target_link_libraries(jni_raw PRIVATE spk_libraw)
+target_link_libraries(jni_raw PRIVATE spk_libraw spektrafilm_engine)
+
+# [r40] Sony ARW 6.0（A7 V 的 Compressed / Compressed HQ）解码器 backport。
+# 上游 LibRaw 0.23 尚未发布，补丁见 libraw-arw6.patch，全部改动都在
+# SPEKTRA_ARW6_DECODER 宏内；关闭时与官方 0.22.2 逐位一致。
+option(SPEKTRA_ARW6 "Backport Sony ARW 6.0 compressed decoder into LibRaw 0.22.2" ON)
+if (SPEKTRA_ARW6)
+    # 必须同时加在 LibRaw 上：sony_arw6.cpp 与 tiff.cpp 的 32766 分支都在
+    # spk_libraw 里编译，只给 jni_raw 定义宏只会让诊断日志报 arw6=1，而真正
+    # 的解码器仍是空翻译单元。
+    target_compile_definitions(spk_libraw PRIVATE SPEKTRA_ARW6_DECODER=1)
+    target_compile_definitions(jni_raw PRIVATE SPEKTRA_ARW6_DECODER=1)
+endif()

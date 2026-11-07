@@ -410,6 +410,18 @@ public:
     // wider than this renders and then cannot be shown.
     virtual uint32_t max_texture_dimension_2d() const = 0;
 
+    // The largest single buffer this backend will bind to a kernel, in bytes.
+    //
+    // This is the number that decides the working resolution of a render: every
+    // plane is `w * h * 3 * 4` bytes and is bound as one SSBO, so a frame past
+    // this cannot be rendered at all -- Vulkan refuses the dispatch, and on some
+    // Adreno parts the refusal arrives as a device loss rather than an error.
+    // It is a per-device answer (128 MiB on many Adreno 7xx, larger on newer
+    // parts and on Metal), which is exactly why it cannot be a constant in the
+    // app: a caller that assumes 128 MiB exports half the pixels the hardware
+    // could have managed.
+    virtual uint64_t storage_range_limit() const = 0;
+
     // --- RFC-020: what the engine holds, and giving it back ---------------
 
     // The pool's holdings, and the persistent allocations made outside it.

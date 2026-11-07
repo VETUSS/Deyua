@@ -59,6 +59,12 @@ struct FrameShape {
     uint32_t long_edge() const { return h > w ? h : w; }
 };
 
+// [DEYVA r40.5] 自动分带试过一版，撤回了：`run_stages_striped` 是 test rig，
+// 19.7 MP 上它 3.4 秒就"跑完"（整帧要 20 多秒）却丢掉了最后一带的 551 行。
+// 留这两个常量只作记录 —— 重新启用之前，先把执行器的丢带查清楚。
+inline constexpr uint64_t kAutoStripPixels = 0ull;
+inline constexpr uint32_t kAutoStripRows = 1024u;
+
 /// A full-width band of a frame: what the executor hands a node that can be
 /// striped (RFC-020 §4.2's classes P, I, F, R).
 ///

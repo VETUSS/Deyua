@@ -70,6 +70,13 @@ Java_com_spektra_android_SpektraEngine_nativeLastError(JNIEnv* env, jobject, jlo
     return to_jstring(env, spk_last_error(eng(enginePtr)));
 }
 
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_spektra_android_SpektraEngine_nativeTrimPool(JNIEnv* env, jobject, jlong enginePtr) {
+    // [r40.5] 导出前先把空闲显存还给驱动，返回释放的字节数（给日志看）。
+    CHECK_NULL_ENGINE(env, enginePtr, 0L)
+    return static_cast<jlong>(spk_trim_pool(eng(enginePtr)));
+}
+
 // ---------------------------------------------------------------------------
 // session：打开一帧
 // ---------------------------------------------------------------------------

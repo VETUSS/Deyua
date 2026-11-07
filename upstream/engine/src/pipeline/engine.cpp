@@ -319,6 +319,15 @@ struct spk_engine {
         backend.set("gpu", Json(gpu ? gpu->device_name() : std::string("none")));
         backend.set("gpu_available", Json(gpu != nullptr));
         backend.set("working_precision", Json(std::string("float32")));
+        // [DEYVA r40] The working-resolution ceiling, reported rather than
+        // guessed. A plane is `w * h * 3 * 4` bytes bound as one SSBO, so this
+        // divided by 12 is the most pixels a single render can hold -- 11.2 MP
+        // at 128 MiB (a 4096-long-edge 3:2 frame, exactly), 4x that on parts
+        // that advertise more. The app reads it before decoding, which is what
+        // lets a device with a larger range export at its full resolution
+        // instead of being capped to the smallest device's budget.
+        backend.set("max_storage_buffer_range",
+                    Json(double(gpu ? gpu->storage_range_limit() : 0)));
         // Contract §6 / RFC-014 §5.1 trap 6: what the engine *loaded*, not
         // what the process could reach. `render_core` was a probe of
         // availability, and that hid a session silently demoted to the CPU
@@ -659,8 +668,15 @@ const char* spk_memory_report(spk_engine* engine) {
     return engine->cached_memory_report.c_str();
 }
 
-spk_status spk_warm_up(spk_engine* engine, const char* film_stock, const char* print_stock,
-                       char** out_json) {
+size_t spk_trim_pool(spk_engine* engine) {
+    if (!engine || !engine->gpu) return 0;
+    // [DEYVA-FIX r40.5] 见头文件：池是缓存，不是账本。空闲块不还给驱动，
+    // 于是"这张照片能不能导出"取决于它前面跑过多少张缩略图和预览 —— 这正是
+    // 同一张 ARW 有时能导、有时 2.9 秒就 VkResult -4 的原因。
+    return engine->gpu->trim_pool(0);
+}
+
+spk_status spk_warm_up(spk_engine* engine, const char* film_stock, const char* print_stock,                       char** out_json) {
     if (!engine) { g_error = "engine is null"; return SPK_ERR_INVALID_ARG; }
     g_error.clear();
     const auto started = std::chrono::steady_clock::now();
@@ -1104,6 +1120,10 @@ bool ensure_meter(spk_session* session, std::string& error) {
 // anything -- and one call site each, so the graph cannot drift between them.
 bool run_film_for(spk_session* session, const Image& source, Image& negative,
                   Progress* progress, std::string& error) {
+    // [r40.5] 自动分带撤回。r40.4 试过"帧 > 16 MP 就走 `run_stages_striped`"，
+    // 结果 19.7 MP 只用 3.4 秒就"渲完"了（整帧要 20 多秒），而最后一带的
+    // 551 行从未写入 —— 分带执行器是 test rig，不是产品路径，它跳过了太多
+    // 工作还没有报错。照片宁可按能跑通的尺寸整帧渲，也不能交一张缺一条的。
     if (session->params.settings.striped) {
         return session->pipeline->run_film_striped(source, negative, progress, error);
     }
@@ -1116,6 +1136,35 @@ bool run_print_for(spk_session* session, const Image& negative, Image& rgb,
         return session->pipeline->run_print_striped(negative, rgb, progress, error);
     }
     return session->pipeline->run_print(negative, rgb, progress, error);
+}
+
+// [DEYVA-FIX v0.8.99] The one copy whose failure is invisible until the JPEG is
+// on screen: the print stage renders whatever landed in the cache, so a band the
+// copy never touched comes out black and a band still holding the previous frame
+// comes out as the same photograph in a different print stock. Three rows,
+// compared against the plane they came from, before anything reads the cache.
+static bool cached_rows_match(gpu::Gpu* gpu, const Image& src, const Image& copy,
+                              std::string& detail) {
+    if (!src.buf || !copy.buf || src.w != copy.w || src.h != copy.h || src.c != copy.c) {
+        detail = "shape";
+        return false;
+    }
+    const size_t row_bytes = size_t(src.w) * src.c * sizeof(float);
+    std::vector<float> a(row_bytes / sizeof(float));
+    std::vector<float> b(a.size());
+    const uint32_t rows[3] = {0u, src.h / 2u, src.h - 1u};
+    for (uint32_t y : rows) {
+        const size_t offset = size_t(y) * row_bytes;
+        if (!gpu->read(src.buf.get(), offset, a.data(), row_bytes, detail) ||
+            !gpu->read(copy.buf.get(), offset, b.data(), row_bytes, detail)) {
+            return false;
+        }
+        if (std::memcmp(a.data(), b.data(), row_bytes) != 0) {
+            detail = "row " + std::to_string(y);
+            return false;
+        }
+    }
+    return true;
 }
 
 bool negative_for(spk_session* session, const Tier& tier, Progress* progress, Image& out,
@@ -1153,6 +1202,20 @@ bool negative_for(spk_session* session, const Tier& tier, Progress* progress, Im
     kept.buf = gpu->alloc_file_backed(negative.bytes(), error);
     if (!kept.buf || !gpu->copy(kept.buf.get(), 0, negative.buf.get(), 0,
                                 negative.bytes(), error)) return false;
+    // [DEYVA-FIX v0.8.99] Verify instead of trusting: at the full tier this copy
+    // is 295 MB, and the copy path has already been caught executing part of a
+    // range and reporting success. One retry, then the log says so -- a picture
+    // with a bad cache is worse than a picture the user knows to distrust.
+    {
+        std::string detail;
+        bool intact = cached_rows_match(gpu, negative, kept, detail);
+        if (!intact) {
+            diag_addf("NEGCOPY:retry(%s);", detail.c_str());
+            intact = gpu->copy(kept.buf.get(), 0, negative.buf.get(), 0, negative.bytes(), error) &&
+                     cached_rows_match(gpu, negative, kept, detail);
+        }
+        diag_addf("NEGCOPY:%s;", intact ? "ok" : "BAD");
+    }
     state.negative = kept;
     state.has_negative = true;
     out = kept;

@@ -198,18 +198,42 @@ val FORMAT_MM = listOf(17f, 22f, 32f, 75f)
 
 // 常见 RAW 扩展名：命中则走引擎 LibRaw 解码，否则走 BitmapFactory 栅格解码
 private val RAW_EXTS = listOf("dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2", "pef", "srf", "x3f", "iiq", "3fr", "fff", "mef", "mos")
+// 「导入文件」放行的普通位图扩展名（SAF 给的是任意文件，得自己挡一道）
+private val RASTER_EXTS = listOf("jpg", "jpeg", "png", "heic", "heif", "tif", "tiff", "webp", "bmp")
 
 class MainActivity : ComponentActivity() {
     private val pendingImport = mutableStateOf<Uri?>(null)
     private val picker = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         pendingImport.value = uri
     }
+
+    /**
+     * [r40] 「导入文件」：绕开系统相册直接读原始文件。
+     *
+     * 相册（Photo Picker）在不少 ROM 上会过滤掉 RAW，或者只给一个转码后的
+     * JPEG 预览 —— 用户看到的就是「相机拍的 ARW 根本不在列表里」。SAF 的
+     * OpenDocument 拿的是文件本身的 content Uri，没有这层过滤。
+     */
+    private val filePicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        val name = rawDisplayName(this, uri)
+        val ext = name.substringAfterLast('.', "").lowercase()
+        if (ext in RAW_EXTS || ext in RASTER_EXTS) {
+            pendingImport.value = uri
+        } else {
+            android.widget.Toast.makeText(
+                this, "不支持的文件类型：${name.ifBlank { "未命名" }}", android.widget.Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Diagnostics.init(applicationContext) // 持久化诊断日志：崩溃后保留上次会话日志
         setContent {
             SpektraScreen(
                 onPickPhoto = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+                onPickFile = { filePicker.launch(arrayOf("*/*")) },
                 pendingImport = pendingImport,
             )
         }
@@ -218,7 +242,7 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
+fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport: MutableState<Uri?>) {
     val ctx = LocalContext.current
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     var engine by remember { mutableStateOf<SpektraEngine?>(null) }
@@ -301,6 +325,10 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
     var thumbPhotoKey by remember { mutableStateOf("") }
     var session by remember { mutableLongStateOf(0L) }
     var sourceW by remember { mutableIntStateOf(0) }
+    // [r40] 相机原生尺寸（RAW 导入时由解码器回报；非 RAW 为 0）。用来区分
+    // 「工作源」与「原生」—— 导出面板要如实说明这两者。
+    var nativeW by remember { mutableIntStateOf(0) }
+    var nativeH by remember { mutableIntStateOf(0) }
     var sourceH by remember { mutableIntStateOf(0) }
     var status by remember { mutableStateOf<String?>(null) }
     var tab by remember { mutableIntStateOf(0) }
@@ -541,6 +569,12 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
             // crop_w/h == 1 时它恰好是 0，geometry 走 identity 分支（连节点都不跑）。
             val cx = (1.0 - cw) / 2.0
             val cy = (1.0 - ch) / 2.0
+            // [r40.1] 下发到引擎的裁剪必须能一眼看到：片边是全尺寸导出里唯一一处
+            // 会改变"帧"尺寸的地方，而帧尺寸又决定画布（长边 = 帧宽 + 两边留白）。
+            // 以前这行只走 android Log.i，诊断日志里看不到，出问题只能猜。
+            Diagnostics.log("render", "OVSCROP fmt=$overscanFormat src=${sourceW}x$sourceH " +
+                "crop=${"%.4f".format(cw)}x${"%.4f".format(ch)} origin=${"%.4f".format(cx)},${"%.4f".format(cy)} " +
+                "→ 帧约 ${(cw * sourceW).toInt()}x${(ch * sourceH).toInt()}")
             android.util.Log.i("Deyva",
                 "overscan: fmt=$overscanFormat mode=$overscanMode gate=$overscanGate holes=$overscanHoles carrier=$overscanCarrier " +
                 "fog=$overscanFog leaks=$overscanLeaks src=${sourceW}x$sourceH crop=${"%.4f".format(cw)}x${"%.4f".format(ch)} " +
@@ -967,7 +1001,21 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
             if (ne.initError != null) {
                 Diagnostics.log("heal", "新引擎创建失败：${ne.initError}"); engineError = "引擎重建失败：${ne.initError}"; return
             }
-            val s = ne.open(px.first, px.second, px.third, 3, "{\"preview_long_edge\":1280}")
+            val s = if (photoIsRaw && srcUri != null) {
+                // RAW 的 photoData 只是长边 1600 的预览小图，按它重开等于把整条
+                // 导出链降到 1600。所以先按原 Uri 重新解码、直开；只有重解码也
+                // 失败时才退回小图 —— 界面能回来比分辨率重要。
+                val again = importRaw(ctx, srcUri!!, ne)
+                if (again != null) {
+                    Diagnostics.log("heal", "RAW 已按原图重解码直开 ${again.session.width}x${again.session.height}")
+                    again.session.session
+                } else {
+                    Diagnostics.log("heal", "RAW 重解码失败，退回预览小图 ${px.second}x${px.third}")
+                    ne.open(px.first, px.second, px.third, 3, "{\"preview_long_edge\":1280}")
+                }
+            } else {
+                ne.open(px.first, px.second, px.third, 3, "{\"preview_long_edge\":1280}")
+            }
             if (s == 0L) { Diagnostics.log("heal", "重新打开图片失败：${ne.lastError()}"); return }
             engine = ne
             session = s
@@ -1183,6 +1231,8 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
         withContext(Dispatchers.Default) {
             try {
                 Diagnostics.log("init", "创建引擎")
+                GpuBudget.attach(ctx)
+                Diagnostics.log("init", GpuBudget.learnedNote())
                 val e = SpektraEngine(ctx); engine = e
                 if (e.initError != null) { engineError = "引擎初始化失败：${e.initError}"; Diagnostics.log("init", "create FAIL: ${e.initError}") }
                 else {
@@ -1214,13 +1264,9 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
             withContext(Dispatchers.Default) {
                 try {
                     val eng = engine ?: throw IllegalStateException("引擎未就绪")
-                    // 释放上一张照片的源数据与缩略图缓存（大 FloatArray，否则连续导入会内存累积 OOM；
-                    // 不清空 thumbCache 则新照片缩略图不会重渲，仍显示上一张）。不强制 System.gc，交给系统回收避免停顿。
-                    photoData = null
-                    // [r38] 两层一起清：只清显示层的话，派生 effect 会立刻用旧照片的
-                    // thumbBase 重新填回来，等于没清。
-                    thumbBase = emptyMap()
-                    thumbCache = emptyMap()
+                    // [r40] 旧图**先不动**：解码成功之后再清。旧版在这里就清空，于是
+                    // 一张解不开的图会把胶片条变成一片白板 —— 用户看到的是「App 坏了」，
+                    // 而不是「这张照片导不进来」。
                     // RAW 检测：photopicker 的 Uri 尾段只有数字无扩展名，用 DISPLAY_NAME 拿真实文件名
                     val seg = rawDisplayName(ctx, pending)
                     photoIsRaw = RAW_EXTS.any { seg.endsWith(".$it") }
@@ -1228,14 +1274,51 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                     srcUri = pending
                     srcName = displayStemName(ctx, pending)
                     Diagnostics.log("import", "源片名=$srcName")
-                    val decoded = if (photoIsRaw) {
-                        decodeRawPhoto(ctx, pending, eng)?.also { Diagnostics.log("import", "RAW 解码成功(引擎 LibRaw)") }
-                            ?: decodePhotoToFloat(ctx, pending)?.also { photoIsRaw = false }
+                    val decoded: Triple<FloatArray, Int, Int>
+                    var rawInfo: RawSession? = null
+                    if (photoIsRaw) {
+                        // 解码与 spk_open 是同一个 JNI 调用，只能整段进闸门：r5 的
+                        // 教训是任何与渲染并发的 open 都可能在同一缓冲池上撞车。
+                        // 导入是用户明确动作，等这几秒比偶发卡死可接受。
+                        val imp = withEngineGate(90000L, "import raw") { importRaw(ctx, pending, eng) }
+                        if (imp != null) {
+                            rawInfo = imp.session
+                            decoded = imp.thumb
+                            Diagnostics.log(
+                                "import",
+                                "RAW 解码成功(引擎 LibRaw→会话)：工作 ${imp.session.width}×${imp.session.height}，" +
+                                    "有效 ${imp.session.activeW}×${imp.session.activeH}，" +
+                                    "帧 ${imp.session.frameW}×${imp.session.frameH}，" +
+                                    "裁右/下 ${imp.session.cutX}/${imp.session.cutY}px"
+                            )
+                        } else {
+                            Diagnostics.log("import", "RAW 直开失败：${eng.rawLastError()}；回退系统解码器")
+                            photoIsRaw = false
+                            decoded = decodePhotoToFloat(ctx, pending)
+                                ?: throw IllegalArgumentException("无法解码所选图片")
+                        }
+                    } else {
+                        decoded = decodePhotoToFloat(ctx, pending)
                             ?: throw IllegalArgumentException("无法解码所选图片")
-                    } else decodePhotoToFloat(ctx, pending)
-                        ?: throw IllegalArgumentException("无法解码所选图片")
-                    photoData = decoded; sourceW = decoded.second; sourceH = decoded.third
-                    Diagnostics.log("import", "解码 OK ${decoded.second}x${decoded.third}")
+                    }
+                    // 解码成功，现在才放掉上一张的源数据与缩略图缓存（大 FloatArray，
+                    // 否则连续导入会内存累积 OOM；不清 thumbCache 则新照片仍显示上一张）。
+                    photoData = null
+                    // [r38] 两层一起清：只清显示层的话，派生 effect 会立刻用旧照片的
+                    // thumbBase 重新填回来，等于没清。
+                    thumbBase = emptyMap()
+                    thumbCache = emptyMap()
+                    photoData = decoded
+                    // 台账要报「工作源」而不是预览小图：导出、片边、裁切都按工作源算。
+                    if (rawInfo != null) {
+                        sourceW = rawInfo.width; sourceH = rawInfo.height
+                        // 「相机原生」报有效成像区（已裁遮罩边），不把光学黑算进分辨率
+                        nativeW = rawInfo.activeW; nativeH = rawInfo.activeH
+                    } else {
+                        sourceW = decoded.second; sourceH = decoded.third
+                        nativeW = 0; nativeH = 0
+                    }
+                    Diagnostics.log("import", "解码 OK 工作源 ${sourceW}x$sourceH")
                     // 日期后背要的拍摄日与数据行：从 EXIF 取。读不到就让日期后背退回当天、
                     // 并且不印数据行 —— 和一台没设时间的相机一样，不编造数值。
                     runCatching { readExifShooting(ctx, pending) }.getOrNull()?.let { (d, line) ->
@@ -1256,9 +1339,13 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                     // 清掉别的照片留下的缩略图文件（缓存目录不该无限长）
                     runCatching { ThumbStore.prune(ctx, thumbPhotoKey) }
                     // release + open 都要在闸门里（r5）：与正在跑的渲染串行，避免同池并发
-                    val s = withEngineGate(30000L, "import open") {
+                    val s = withEngineGate(60000L, "import open") {
                         if (session != 0L) { runCatching { eng.sessionRelease(session) }; session = 0L }
-                        eng.open(decoded.first, decoded.second, decoded.third, 3, "{\"preview_long_edge\":1280}")
+                        // RAW 的会话在解码时已经建好（像素没有经过 Java 堆），这里只接管；
+                        // 其它格式照旧从 float 源 open。
+                        rawInfo?.session
+                            ?: eng.open(decoded.first, decoded.second, decoded.third, 3,
+                                        "{\"preview_long_edge\":1280}")
                     } ?: 0L
                     if (s == 0L) throw IllegalStateException("打开图片失败：${eng.lastError()}")
                     session = s
@@ -1266,7 +1353,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                     // ProPhoto→sRGB 矩阵与 sRGB 编码曲线，否则长按「原图」是一片死黑。
                     photoBmp = makeThumb(decoded.first, decoded.second, decoded.third, 1600, photoIsRaw)
                     setStep(0, true, false)
-                    status = "已导入 ${decoded.second}×${decoded.third}，正在冲洗…"
+                    status = "已导入 ${sourceW}×${sourceH}，正在冲洗…"
                     val b = renderWithHeal(eng, s, "import")
                     // 失败时保留上一帧，不要把画面清空成转圈（转圈会让人以为整个 App 挂了）
                     if (b != null) {
@@ -1529,6 +1616,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
             Column(Modifier.fillMaxSize()) {
                 TopBar(
                     onPickPhoto = onPickPhoto,
+                    onPickFile = onPickFile,
                     onGallery = { showGallery = true },
                     // [r26] 点「诊断」时顺手量一次当前成片的色相，再弹日志。
                     // 导入那条只在换照片时打一次；用户要是"换了胶片再看绿"，就得有按需测一次的入口，
@@ -2155,6 +2243,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                             // 还永远写着"1张"。换成源片的真实像素尺寸：唯一有信息量的一项。
                             imgName = if (sourceW > 0 && sourceH > 0) "$sourceW×$sourceH" else "—",
                             sourceW = sourceW, sourceH = sourceH,
+                            nativeW = nativeW, nativeH = nativeH,
                             // [r11 第 4 批] 命名 token 的三份取值。直扫底片时相纸位写 film-scan：
                             // 那份文件确实没有经过相纸，名字里不该出现纸名。
                             srcName = srcName, filmName = labelOf(filmVariant),
@@ -2173,18 +2262,291 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                         Diagnostics.log("export", "开始导出 fmt=${fmt.label} color=$renderColor size=$sizeL q=$q dest=$saveDest stem=$stem")
                                         // [r5] 导出原来在裸线程里直接用主会话渲染，与预览渲染并发跑在
                                         // 同一个 VkDevice 上（GPU 挂起的一个来源）。收进闸门串行执行。
-                                        val fullFrame = withEngineGate(60000L, "export full") {
-                                            eng.setParams(sess, "{\"output_color_space\":\"$renderColor\",\"output_cctf_encoding\":true}")
-                                            setStep(1, true, false); setStep(2, false, true)
-                                            eng.renderFrame(sess, "full")
+                                        //
+                                        // [r40] 渲染**之前**先按设备能力判定，绝不先试一次会顶破
+                                        // SSBO 的 full：在部分 Adreno 上那不是报错，是设备丢失。
+                                        // 预算够时 plan 为 null，full 就是源图 = 相机原生分辨率。
+                                        val ratios = overscanRatios(
+                                            eng, sess, sourceW, sourceH, overscanActive && !forceNoOverscan)
+                                        val exportArea = ratios.area
+                                        val targetEdge = if (sizeL == "全尺寸") 0
+                                                         else sizeL.toIntOrNull() ?: 0
+                                        val plan = GpuBudget.planExport(
+                                            eng, sourceW, sourceH, ratios.kept, exportArea, targetEdge)
+                                        var exportNote: String? = plan?.note
+                                        // [r40.2] 「这次要渲染多大的画布」必须写在最前面：
+                                        // 导出失败时，这一行是唯一能回推的账。片边画布的面积
+                                        // 是 源 × 裁剩 × 画布/帧，三个数都来自 live 布局，
+                                        // 所以全尺寸的画布在渲染之前就能算出来。
+                                        val plannedCanvasPx =
+                                            (sourceW.toDouble() * sourceH * ratios.kept * exportArea).toLong()
+                                        Diagnostics.log("export", "预算输入：画布 " +
+                                            "${"%.1f".format(plannedCanvasPx / 1e6)}MP" +
+                                            "（源 ${sourceW}x$sourceH 裁剩×${"%.3f".format(ratios.kept)} " +
+                                            "片边×${"%.3f".format(exportArea)}） " +
+                                            "${GpuBudget.learnedNote()} " +
+                                            "单块=${GpuBudget.usableRangeBytes(eng) / 1048576}MiB")
+                                        // [r40.6] 这行以前会写"分带"，但引擎侧的分带在 r40.5 已经
+                                        // 撤回了（执行器丢带）。留着会让人以为走了另一条路，
+                                        // 排查时反而被它带偏 —— 日志里只能写真实发生的事。
+                                        Diagnostics.log("export", "渲染路径：整帧 " +
+                                            "${"%.1f".format(plannedCanvasPx / 1e6)}MP（丢写会在渲染后逐行补全）")
+                                        if (exportNote != null) Diagnostics.log("export", "预算判定：$exportNote")
+
+                                        // 渲染失败时把**异常里的原文**留下来：设备丢失的判据
+                                        // 就在这句话里（VkResult -4），而 eng.lastError() 有时
+                                        // 已经被下一次调用冲掉。
+                                        var lastRenderErr: String? = null
+
+                                        fun renderExportFrame(tier: String, edge: Int): Frame16? =
+                                            withEngineGate(60000L, "export $tier") {
+                                                eng.setParams(sess, "{\"output_color_space\":\"$renderColor\",\"output_cctf_encoding\":true}")
+                                                setStep(1, true, false); setStep(2, false, true)
+                                                if (edge > 0) runCatching {
+                                                    eng.setParams(sess, "{\"preview_long_edge\":$edge}")
+                                                }
+                                                try {
+                                                    eng.renderFrame(sess, tier)
+                                                } catch (t: Throwable) {
+                                                    // [r40.2] 设备丢失时 renderFrame 是**抛异常**而不是
+                                                    // 返回 null（日志里那句 "Vulkan compute dispatch
+                                                    // failed (VkResult -4)" 就是这么来的）。以前这个
+                                                    // 异常一路穿到最外层 catch，于是下面"设备丢失 → 重建
+                                                    // 引擎 + 把这次的画布尺寸记成死线"那段成了死代码，
+                                                    // 每次失败都白白重启一次而不长记性。
+                                                    Diagnostics.log("export", "renderFrame($tier) 抛异常：${t.message}")
+                                                    lastRenderErr = t.message
+                                                    null
+                                                } finally {
+                                                    // 无论成败都把预览尺寸还回去，否则导出后整场都变慢
+                                                    if (edge > 0) runCatching {
+                                                        eng.setParams(sess, "{\"preview_long_edge\":1280}")
+                                                    }
+                                                }
+                                            }
+
+                                        // 真要渲的画布像素：预算判过档就按降档后的长边折算，
+                                        // 否则就是原尺寸。失败时记进死线的必须是**这个**数，
+                                        // 不是"本来想要的那个"—— 否则一次降档失败会把上限
+                                        // 压得比实际需要更低。
+                                        val srcLongEdge = maxOf(sourceW, sourceH).toDouble()
+                                        val attemptCanvasPx = if (plan == null) plannedCanvasPx else {
+                                            val k = plan.liveEdge / srcLongEdge
+                                            (plannedCanvasPx * k * k).toLong()
+                                        }
+
+                                        // [r40.5] 导出前把渲染池里的空闲块还给驱动。
+                                        //
+                                        // 池只复用、不归还：一块平面出了作用域，显存仍然留着
+                                        // 等下一次同尺寸请求。预览时这是对的取舍，但导出前它
+                                        // 就变成了"这张照片能不能导出"的变量 —— 前面那几十张
+                                        // 缩略图、几次胶片预览留下的块，会和 full 要的块叠在
+                                        // 一起。同一张 ARW 有时能导、有时 2.9 秒 VkResult -4，
+                                        // 差的就是这里。
+                                        val freedBytes = runCatching { eng.trimPool() }.getOrDefault(0L)
+                                        Diagnostics.log("export", "显存整理：释放 " +
+                                            "${freedBytes / 1048576}MiB 空闲块；${poolSummary(eng)}")
+
+                                        var fullFrame = renderExportFrame(
+                                            plan?.tier ?: "full", plan?.liveEdge ?: 0)
+                                        if (fullFrame == null) {
+                                            val firstErr = lastRenderErr ?: eng.lastError()
+                                            if (GpuBudget.isDeviceLost(firstErr)) {
+                                                // 设备丢了：同一 VkDevice 上再降档也没用，只能重建引擎。
+                                                // [r40.2] 顺手把这次的画布尺寸记成"死线"（持久化），
+                                                // 下次导出直接从它下面 20% 起算 —— 这台机器不会再拿
+                                                // 同一个尺寸去撞第二次。
+                                                GpuBudget.noteCanvas(attemptCanvasPx, false)
+                                                Diagnostics.log("export", "设备丢失（$firstErr），画布 " +
+                                                    "${"%.1f".format(attemptCanvasPx / 1e6)}MP 记为死线；" +
+                                                    "重建引擎后重试，下次上限约 " +
+                                                    "${"%.1f".format(attemptCanvasPx * 0.8 / 1e6)}MP")
+                                                mainHandler.post { runCatching { recoverRender("导出时设备丢失") } }
+                                                exportOk = false
+                                                status = "导出失败：画面太大，GPU 设备丢失（已记下本机上限，重建引擎后重试会自动按更小尺寸出图）"
+                                                onDone(); return@Thread
+                                            }
+                                            // 预算算漏了（例如布局还没生成）：降一档重试一次，不逐级探
+                                            val retryEdge = (((plan?.liveEdge ?: maxOf(sourceW, sourceH)) * 3) / 4)
+                                                .coerceIn(640, 16384)
+                                            Diagnostics.log("export", "首次渲染失败（$firstErr），降到 $retryEdge 长边重试")
+                                            fullFrame = renderExportFrame("live", retryEdge)
+                                            if (fullFrame != null) {
+                                                exportNote = "GPU 预算不足，本次按 $retryEdge 长边渲染"
+                                            }
+                                        }
+                                        // [r40.6] 渲染自愈 —— 这是这一串问题的正解，不是又一次试探。
+                                        //
+                                        // 这颗 Adreno 830 在大画布上不是"渲错"，是**有几行根本没渲**：
+                                        // dispatch 返回成功，那几行的显存却从未被写过（所以整行恒 0，
+                                        // 而不是欠曝）。证据是同一个 6073x4051 有三次不同的坏法：
+                                        // 顶部 32% 全零、底部 15% 全零、"上下两种调子"。
+                                        // 位置每次都不一样 → 说明它是**丢**出来的，不是算错的。
+                                        //
+                                        // 既然是丢，就可以补：渲两遍，逐行取两份里非零的那一份。
+                                        // 两遍的缺口不重叠的概率很高，拼完就是完整的。万一两遍缺在同一处，
+                                        // 再降一档重渲（缺口随画布变小而消失，7.7 MP 从来不缺）。
+                                        // 代价是多花一次渲染的时间，换来的是"交出去的图一定是完整的"。
+                                        run {
+                                            val frame0 = fullFrame!!
+                                            val keepW = frame0.w
+                                            val keepH = frame0.h
+                                            var blanks = blankRowMask(frame0)
+                                            var blankCount = blanks.count { it }
+                                            if (blankCount == 0) {
+                                                Diagnostics.log("export", "渲染自愈：首帧完整（$keepW" + "x$keepH 无空行）")
+                                            } else {
+                                                Diagnostics.log("export", "渲染自愈：首帧有 $blankCount/" +
+                                                    "$keepH 行从未写入（${"%.1f".format(blankCount * 100.0 / keepH)}%），" +
+                                                    "同尺寸重渲并逐行合并")
+                                                // 最多再渲两遍：缺口是随机丢出来的，三遍的缺口同时落在
+                                                // 同一行的概率极低。每遍之前清一次池 —— 两遍若共用同一批
+                                                // 已损坏的块，缺口就会落在同一处，合并也就白做。
+                                                var pass = 0
+                                                while (blankCount > 0 && pass < 2) {
+                                                    pass++
+                                                    runCatching { eng.trimPool() }
+                                                    val alt = renderExportFrame(
+                                                        plan?.tier ?: "full", plan?.liveEdge ?: 0)
+                                                    if (alt == null || alt.w != keepW || alt.h != keepH) {
+                                                        Diagnostics.log("export",
+                                                            "渲染自愈：第 ${pass + 1} 帧尺寸不符或失败，停止重渲")
+                                                        break
+                                                    }
+                                                    val altBlank = blankRowMask(alt)
+                                                    val filled = fillBlankRows(
+                                                        frame0, alt, blanks, altBlank)
+                                                    blanks = blankRowMask(frame0)
+                                                    blankCount = blanks.count { it }
+                                                    Diagnostics.log("export", "渲染自愈：第 ${pass + 1} 帧" +
+                                                        "补上 $filled 行，剩余空行 $blankCount")
+                                                }
+                                            }
+                                            // 剩下的缺口如果不足 1%（4000 行里的几十行），
+                                            // 用邻行填平就够了 —— 这是"补全"，不是"遮盖"：
+                                            // 那几十行本来就该和上下行连续，填进去没有接缝，
+                                            // 却换来一个不必为它牺牲分辨率的理由。
+                                            if (blankCount > 0 && blankCount * 100 <= keepH) {
+                                                val healed = fillFromNeighborRows(frame0, blanks)
+                                                blanks = blankRowMask(frame0)
+                                                blankCount = blanks.count { it }
+                                                Diagnostics.log("export", "渲染自愈：缺口不足 1%，" +
+                                                    "用邻行填平 $healed 行，剩余 $blankCount")
+                                            }
+                                            // 缺口超过 1% 说明这个画布尺寸本身在这台机器上写不完整。
+                                            // 降一档重渲，并且只接受"整帧完整"的结果：
+                                            // 交一张小一点但完整的图，好过交一张大而破的。
+                                            if (blankCount * 100 > keepH) {
+                                                var edge = (maxOf(keepW, keepH) * 4 / 5)
+                                                var fixed: Frame16? = null
+                                                var tries = 0
+                                                while (fixed == null && tries < 2) {
+                                                    Diagnostics.log("export", "渲染自愈：$blankCount 行仍缺，" +
+                                                        "降到长边 $edge 重渲")
+                                                    runCatching { eng.trimPool() }
+                                                    val f = renderExportFrame("live", edge) ?: break
+                                                    val bad = blankRowMask(f).count { it }
+                                                    if (bad * 50 <= f.h) {
+                                                        fixed = f
+                                                        exportNote = "GPU 无法完整写入 ${keepW}x$keepH，" +
+                                                            "本次按 ${f.w}x${f.h} 输出（完整）"
+                                                        Diagnostics.log("export", "渲染自愈：${f.w}x${f.h} 完整，采用")
+                                                    } else {
+                                                        Diagnostics.log("export", "渲染自愈：$edge 长边仍有 $bad 行空，" +
+                                                            "再降一档")
+                                                        edge = (edge * 4 / 5).coerceAtLeast(640)
+                                                        tries++
+                                                    }
+                                                }
+                                                if (fixed != null) {
+                                                    fullFrame = fixed
+                                                } else {
+                                                    exportNote = "这台机器无法完整写入 " +
+                                                        "${keepW}x$keepH，降档两次仍有缺行。已按能写出" +
+                                                        "的最大尺寸导出，请检查是否有横带"
+                                                    Diagnostics.log("export", "渲染自愈：降档两次仍不完整，" +
+                                                        "按当前帧导出（成品可能有横带）")
+                                                }
+                                            }
                                         }
                                         // [r37] 导出走和预览同一条 16 bit 路径：全尺寸是断层最容易
                                         // 被看见的地方（放大看天空、看灰阶过渡），降到 8 bit 再调色
                                         // 等于把引擎算出的精度扔掉。
                                         val fullRaw = fullFrame?.toBitmap()
                                         if (fullRaw == null || fullFrame == null) { Diagnostics.log("export", "full 渲染失败 ${eng.lastError()}"); exportOk = false; status = "导出失败：全尺寸渲染失败"; onDone(); return@Thread }
+                                        val out16 = fullFrame!!
                                         setStep(2, true, false); setStep(3, false, true)
                                         Diagnostics.log("export", "full 渲染 ${fullRaw.width}x${fullRaw.height}")
+                                        // [r40.2] 记住"这个尺寸跑通了"。它是死线的反证：以后只要
+                                        // 有比死线更大的画布真跑通，死线就作废（可能只是当时过热）。
+                                        GpuBudget.noteCanvas(out16.w.toLong() * out16.h, true)
+                                        // [r40.1] 全尺寸导出在 5780×4868 这一档出现"画面只在上半"的
+                                        // 故障：画布 28 MP 时引擎的片边布局与成品尺寸对不上，需要
+                                        // 引擎自己说它按什么帧、什么门幅、什么 mm/px 排的版。正常
+                                        // 渲染路径每帧都会打 OVSLAYOUT，导出这条路径以前不打，所以
+                                        // 出问题时只能靠猜。注意：这一句会按 **live** 档重算布局，
+                                        // 必须放在 renderExportFrame 之后，否则会把全尺寸的布局冲掉。
+                                        // [r40.3] 不再只在片边打开时才打这一行。引擎把每个渲染阶段的
+                                        // 亮度探针攒在一条诊断串里，随片边布局报告一起吐出来；
+                                        // 导出这条路径以前从不索取报告，于是"哪一阶段开始出现横带"
+                                        // 永远查不到。这一句既拿到布局，也顺手把全尺寸这一帧的
+                                        // 阶段探针取出来（tag^8 行剖面，能跨过任意横带）。
+                                        runCatching {
+                                            Diagnostics.log("export", "EXPLAYOUT " + eng.overscanLayout(sess).take(1200))
+                                        }
+                                        Diagnostics.log("export", "EXPORTDIMS tier=${plan?.tier ?: "full"} " +
+                                            "edge=${plan?.liveEdge ?: 0} src=${sourceW}x$sourceH " +
+                                            "area=${"%.3f".format(exportArea)} " +
+                                            "ssbo=${GpuBudget.usableRangeBytes(eng) / 1048576}MiB " +
+                                            "px=${"%.1f".format(fullRaw.width.toDouble() * fullRaw.height / 1e6)}MP")
+                                        // [r40.1] 渲染后自检：把 16 bit 帧按横向切成 8 段，
+                                        // 统计每段亮度均值 + "整条扫描线全为 0"的行数。全零行
+                                        // 意味着这些像素**从未被写过**（不是欠曝），这是把
+                                        // "画布只画了一半 / 下半截没被 dispatch 覆盖"与"画面本来
+                                        // 就暗"分开的唯一硬判据，不依赖对成品的肉眼判断。
+                                        // 段均 -> 8 个数就是成品的纵向剖面：正常照片各段差别不大，
+                                        // 若前几段有值、后几段恒 0，问题在 GPU 写入侧；若 8 段都
+                                        // 正常，问题在 Layer2 之后的编码/封装侧。
+                                        runCatching {
+                                            val fw = out16.w; val fh = out16.h
+                                            val px16 = out16.px
+                                            val rowsStep = maxOf(1, fh / 160)
+                                            val colStep = maxOf(1, fw / 192)
+                                            val bandN = 8
+                                            val bandSum = DoubleArray(bandN)
+                                            val bandCnt = LongArray(bandN)
+                                            var zeroRows = 0
+                                            var lastNonZero = -1
+                                            var y = 0
+                                            while (y < fh) {
+                                                var rowMax = 0
+                                                val b = (y.toLong() * bandN / fh).toInt().coerceIn(0, bandN - 1)
+                                                var x = 0
+                                                while (x < fw) {
+                                                    val v = px16[(y * fw + x) * 4].toInt() and 0xFFFF
+                                                    if (v > rowMax) rowMax = v
+                                                    bandSum[b] += v.toDouble(); bandCnt[b]++
+                                                    x += colStep
+                                                }
+                                                if (rowMax == 0) zeroRows++ else lastNonZero = y
+                                                y += rowsStep
+                                            }
+                                            val bands = (0 until bandN).joinToString(",") { b ->
+                                                "%.0f".format(if (bandCnt[b] > 0) bandSum[b] / bandCnt[b] / 257.0 else 0.0)
+                                            }
+                                            Diagnostics.log("export", "EXPORTCHECK ${fw}x$fh " +
+                                                "段均(0-255)=$bands 全零行=$zeroRows 末非零行=$lastNonZero " +
+                                                "行步=$rowsStep 列步=$colStep")
+                                            // [r40.3] 静默的坏图比失败更糟。整行全 0 只可能来自
+                                            // "这些像素从未被写入"，不是欠曝；一旦超过 2% 就在这里
+                                            // 明说，别让用户过几天才发现照片里有横带。
+                                            val zeroPct = zeroRows.toDouble() * rowsStep / fh
+                                            if (zeroPct > 0.02) Diagnostics.log("export",
+                                                "EXPORTWARN 约 ${
+                                                    "%.0f".format(zeroPct * 100)
+                                                }% 的行整行全 0（$zeroRows 条采样行）——这部分像素从未写入，" +
+                                                "成品会带横带/黑边；请连同本段日志一起反馈")
+                                        }
                                         // [r33] 调色必须在 HDR 封装**之前**，而且必须作用在 full 本身
                                         // 而不是放在最后对成品再套一遍：
                                         //  · gain map 是相对 SDR 主图算的，主图先调色、增益图后生成，
@@ -2193,7 +2555,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                         // 用的是和预览完全相同的 Layer2 —— 预览看到什么就导出什么。
                                         // [r37] 优先走 16 bit：全尺寸导出是断层最容易被看见的地方。
                                         val full = if (tone.isIdentity) fullRaw else
-                                            (Layer2.apply16(fullFrame.px, fullFrame.w, fullFrame.h, tone)
+                                            (Layer2.apply16(out16.px, out16.w, out16.h, tone)
                                                 ?: Layer2.apply(fullRaw, tone))
                                         if (!tone.isIdentity) {
                                             Diagnostics.log("export", "Layer2 已应用 ${full.width}x${full.height} " +
@@ -2398,6 +2760,11 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
                                                 status = if (ok) "已导出成片（${fmt.label}→${actualExt}·${out.width}×${out.height}）" else "导出失败"
                                             }
                                         }
+                                        val note = exportNote
+                                        if (note != null) {
+                                            val cur = status ?: ""
+                                            if (cur.startsWith("已导出")) status = "$cur；$note"
+                                        }
                                         runCatching { eng.setParams(sess, "{\"output_color_space\":\"sRGB\",\"output_cctf_encoding\":true}") }
                                     } catch (e: Exception) {
                                         Diagnostics.log("export", "异常 ${e.message}")
@@ -2416,9 +2783,21 @@ fun SpektraScreen(onPickPhoto: () -> Unit, pendingImport: MutableState<Uri?>) {
 
     if (showLog) {
         val eng = engine
-        val text = remember(eng) {
+        // [r40.1] 引擎侧的当前参数（只摘片边与几何）。诊断日志原来只有"参数 Schema"
+        // ——那是字段表，不是这一张图实际生效的值；片边画幅没裁对、留白算错的时候，
+        // 唯一能定位的就是 io.geometry.crop_* 与 film_render.overscan.* 的实际数值。
+        // 这里用 showLog 作 key，每次打开面板都重新问一次引擎，不吃旧值。
+        val liveParams = remember(showLog, eng, session) {
+            if (eng == null || session == 0L) ""
+            else runCatching { eng.getParams(session) }.getOrNull()?.let { json ->
+                val re = Regex("\"((?:io\\.geometry|film_render\\.overscan|io\\.preview)[^\"]*)\"\\s*:\\s*(\"[^\"]*\"|[^,}]+)")
+                re.findAll(json).joinToString("\n") { "${it.groupValues[1]} = ${it.groupValues[2].trim()}" }
+            } ?: ""
+        }
+        val text = remember(eng, liveParams) {
             buildString {
                 append("==== 引擎能力 ====\n").append(eng?.capabilities ?: "(未创建)").append("\n\n")
+                append("==== 当前片边/几何 ====\n").append(liveParams.ifEmpty { "(未就绪)" }).append("\n\n")
                 append("==== 参数 Schema ====\n").append(eng?.paramsSchema ?: "").append("\n\n")
                 append("==== 运行日志 ====\n").append(Diagnostics.dump())
             }
@@ -2876,13 +3255,190 @@ private fun displayStemName(ctx: Context, uri: Uri): String {
     return name.substringBeforeLast('.').ifEmpty { "IMG" }
 }
 
-// RAW 解码：content Uri 拷贝到缓存文件，走引擎 LibRaw 解码（decodeRawPhoto）→ packed RGB float(线性 ProPhoto)
-private fun decodeRawPhoto(ctx: Context, uri: Uri, eng: SpektraEngine): Triple<FloatArray, Int, Int>? {
+// [r40.2] 片边把照片"变成成品"的两步倍率，必须在渲染**之前**算出来，否则
+// 预算判定就是在猜：
+//   kept —— 片边先按门幅比例裁一刀，源图里还剩多少面积（≤1，关片边时 1）；
+//   area —— 画布 / 帧（≥1，多出来的是片边与齿孔）。
+// 两个倍率都与 tier 尺寸无关，所以拿 live 的布局算 full 的账也是准的。
+private data class OverscanRatios(val area: Double, val kept: Double)
+
+/**
+ * r40.5 一句话说清渲染池现在占了多少显存。
+ *
+ * `spk_memory_report` 里的 pool 段有 total/live/free/frame_high_water 四个数，
+ * 导出失败时这四个数比"崩了"三个字有用得多：`live` 是这次渲染真正要的，
+ * `free` 是池里白占的，`frame_high_water` 是这块芯片历史上同时活过多少。
+ */
+private fun poolSummary(eng: SpektraEngine): String {
+    val s = runCatching { eng.memoryReport() }.getOrNull() ?: return "池 (读不到)"
+    fun n(key: String): Long =
+        Regex("\"$key\"\\s*:\\s*([0-9]+)").find(s)?.groupValues?.get(1)?.toLongOrNull() ?: -1L
+    fun mib(v: Long) = if (v < 0) "?" else "${v / 1048576}"
+    return "池 占用=${mib(n("live_bytes"))}MiB 空闲=${mib(n("free_bytes"))}MiB " +
+        "峰值=${mib(n("frame_high_water_bytes"))}MiB"
+}
+
+/**
+ * r40.6 标出 16 bit 帧里「从未被写入」的行。
+ *
+ * 判据是"整行三个通道都严格为 0"。16 bit 下真正的暗部几乎不可能整行恒 0
+ * （胶片黑位也有 ±1 码的噪声），所以恒 0 只能是"这块显存没被 dispatch 写过"。
+ * 这正是 Adreno 830 在大画布上的表现：dispatch 返回成功，行却没写。
+ *
+ * 单行只取 96 个等距采样点 —— 丢写是按整段行丢的，不会只丢一行里的一小截；
+ * 全宽扫 24.6 MP 要过两亿次，导出本来就慢，没必要。
+ */
+private fun blankRowMask(f: Frame16): BooleanArray {
+    val out = BooleanArray(f.h)
+    val px = f.px
+    val w = f.w
+    if (w <= 0 || f.h <= 0) return out
+    val w4 = w * 4
+    val step = maxOf(1, w / 96)
+    var y = 0
+    while (y < f.h) {
+        val base = y * w4
+        var blank = true
+        var x = 0
+        while (x < w) {
+            val o = base + x * 4
+            if ((px[o].toInt() or px[o + 1].toInt() or px[o + 2].toInt()) != 0) { blank = false; break }
+            x += step
+        }
+        out[y] = blank
+        y++
+    }
+    return out
+}
+
+/**
+ * r40.6 把 alt 里有内容、而 dst 里是空白的行整行搬过去。
+ *
+ * 两次渲染的缺口位置不重叠时，这一步就是「补全」。返回补了多少行。
+ * 尺寸不同不能合并 —— 那种情况只能整帧替换（调用方自己判断）。
+ */
+private fun fillBlankRows(dst: Frame16, alt: Frame16, blank: BooleanArray,
+                          altBlank: BooleanArray): Int {
+    if (dst.w != alt.w || dst.h != alt.h) return 0
+    val d = dst.px
+    val a = alt.px
+    val w4 = dst.w * 4
+    var filled = 0
+    var y = 0
+    while (y < dst.h) {
+        if (blank[y] && !altBlank[y]) {
+            val o = y * w4
+            System.arraycopy(a, o, d, o, w4)
+            filled++
+        }
+        y++
+    }
+    return filled
+}
+
+/**
+ * r40.6 最后剩下的几十行不值得为它降分辨率。
+ *
+ * 到这一步，缺口已经是零零星星的单行。整行是空的，上下邻行本来就在画面里
+ * 连着，直接拿最近的非空行填掉 —— 一行像素在 4000 行里看不出来，但一条
+ * 全黑的横带一眼就能看见。宁可补，不留缝。
+ */
+private fun fillFromNeighborRows(f: Frame16, blank: BooleanArray): Int {
+    val w4 = f.w * 4
+    val px = f.px
+    var filled = 0
+    var y = 0
+    while (y < f.h) {
+        if (blank[y]) {
+            var up = y - 1
+            while (up >= 0 && blank[up]) up--
+            val src = if (up >= 0) up else {
+                var dn = y + 1
+                while (dn < f.h && blank[dn]) dn++
+                if (dn < f.h) dn else -1
+            }
+            if (src >= 0) {
+                System.arraycopy(px, src * w4, px, y * w4, w4)
+                filled++
+            }
+        }
+        y++
+    }
+    return filled
+}
+
+private fun overscanRatios(
+    eng: SpektraEngine, session: Long, srcW: Int, srcH: Int, overscanOn: Boolean,
+): OverscanRatios {
+    if (!overscanOn) return OverscanRatios(1.0, 1.0)
+    var area = 0.0
+    var kept = 1.0
+    runCatching {
+        val s = eng.overscanLayout(session)
+        fun num(key: String): Double =
+            Regex("\"$key\"\\s*:\\s*([0-9.]+)").find(s)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
+        val fw = num("frame_w"); val fh = num("frame_h")
+        val cw = num("canvas_w"); val ch = num("canvas_h")
+        if (fw > 0 && fh > 0 && cw > 0 && ch > 0) {
+            area = (cw / fw) * (ch / fh)
+            // 帧比源图更"瘦"就是被横着裁了一刀，剩下的面积按比例反过来算；
+            // 反过来（帧更宽）说明裁的是上下，同理。两向取小即可。
+            if (srcW > 0 && srcH > 0) {
+                val frameAspect = fw / fh
+                val srcAspect = srcW.toDouble() / srcH
+                kept = minOf(1.0, frameAspect / srcAspect, srcAspect / frameAspect)
+            }
+        }
+    }
+    if (area <= 1.0001) area = GpuBudget.FALLBACK_OVERSCAN_AREA
+    return OverscanRatios(area, kept)
+}
+
+// 导入时顺带生成的预览小图长边：缩略图源与「长按看原图」都用它。
+// 45 MP 的全幅 float 是 440 MB，堆上不会再放这一份。
+private const val IMPORT_PREVIEW_EDGE = 1600
+
+private data class RawImport(
+    val session: RawSession,
+    val thumb: Triple<FloatArray, Int, Int>,
+)
+
+/**
+ * [r40] RAW 导入：解码、裁遮罩边、按设备预算缩放，然后**直接在 native 侧开会话**。
+ *
+ * 旧路径把解码结果变成 Java float[] 再交给引擎，45 MP 时堆上要住 440 MB，
+ * 于是解码只能砍半 —— 「导出不是全分辨率」的根因在导入这一端。现在像素
+ * 全程留在 native 堆，工作分辨率只由设备的 SSBO 上限和内存决定。
+ *
+ * 返回的 thumb 是长边 ≤1600 的小图，只用于缩略图与原图对比。
+ */
+private fun importRaw(ctx: Context, uri: Uri, eng: SpektraEngine): RawImport? {
     val f = File(ctx.cacheDir, "import_raw_${System.currentTimeMillis()}.dng")
     try {
-        ctx.contentResolver.openInputStream(uri)?.use { input -> f.outputStream().use { input.copyTo(it) } } ?: return null
-        val r = eng.decodeRaw(f.absolutePath) ?: return null
-        return Triple(r.first, r.second.first, r.second.second)
+        ctx.contentResolver.openInputStream(uri)?.use { input ->
+            f.outputStream().use { input.copyTo(it) }
+        } ?: return null
+
+        // 先只读头：机型/解码器写日志，同时也让「这一档 ARW 到底走哪个解码器」
+        // 在真机日志里可查（A7 V 的 Compressed 需要 sony_arw6_load_raw 补丁）。
+        val probe = eng.rawProbe(f.absolutePath)
+        val workPixels = GpuBudget.workPixels(eng, Runtime.getRuntime().maxMemory())
+        Diagnostics.log(
+            "import",
+            "RAW 头：${probe ?: "探测失败"}；设备预算 ${workPixels / 1_000_000} MP" +
+                "（约 ${GpuBudget.estimateEdge(workPixels)} 长边 @3:2），" +
+                "SSBO ${eng.maxStorageBufferRange / 1048576} MiB"
+        )
+
+        // 小图缓冲按 1:1 上限分配，实际写回长度由 outSize 决定。
+        val thumbBuf = FloatArray(IMPORT_PREVIEW_EDGE * IMPORT_PREVIEW_EDGE * 3)
+        val session = eng.decodeRawOpen(
+            f.absolutePath, workPixels, "{\"preview_long_edge\":1280}", thumbBuf
+        ) ?: return null
+        if (session.thumbW <= 0 || session.thumbH <= 0) {
+            Diagnostics.log("import", "小图生成失败（thumb=0），缩略图将退回工作源降采样")
+        }
+        return RawImport(session, Triple(thumbBuf, session.thumbW, session.thumbH))
     } finally {
         runCatching { f.delete() }
     }

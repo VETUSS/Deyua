@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun TopBar(
     onPickPhoto: () -> Unit,
+    onPickFile: () -> Unit,
     onGallery: () -> Unit,
     onDiagnose: () -> Unit,
 ) {
@@ -53,6 +54,8 @@ fun TopBar(
         }
         Spacer(Modifier.weight(1f))
         DvIconButton(Glyph.Plus, "导入照片", onPickPhoto, tint = Dv.accent, glyphSize = 23.dp)
+        // 相册看不到 RAW 的机型上，这个入口是唯一能导入原始文件的路
+        DvIconButton(Glyph.Document, "导入文件", onPickFile, tint = Dv.label1, glyphSize = 21.dp)
         DvIconButton(Glyph.Grid, "相册", onGallery, tint = Dv.label2, glyphSize = 20.dp)
         DvIconButton(Glyph.Pulse, "诊断日志", onDiagnose, tint = Dv.label2, glyphSize = 21.dp)
     }

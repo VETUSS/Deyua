@@ -54,6 +54,9 @@ enum class ExportFormat(val label: String, val ext: String) {
 }
 val EXPORT_COLOR_SPACES = listOf("sRGB", "Display P3")  // Display P3 导出会嵌入 ICC，相册按 P3 正确显示
 val EXPORT_SIZES = listOf("全尺寸", "2048", "1600", "1280")
+// [r40] 档位的真实像素值。`size` 存的是**索引**，旧版直接拿它当长边算，于是选
+// 「2048」（索引 1）时面板显示 "1 × 0 · 0.0 MP"；竖幅照片还会把 sourceW 当长边。
+val EXPORT_SIZE_PX = listOf(0, 2048, 1600, 1280)   // 0 = 不缩，用工作源本身
 
 // 配方 = 格式+色彩 预设组合
 data class Recipe(val name: String, val format: ExportFormat, val color: String, val cctf: Boolean)
@@ -248,6 +251,9 @@ private fun formatDepth(f: ExportFormat): String = when (f) {
 @Composable
 fun ExportPanel(
     imgName: String, sourceW: Int, sourceH: Int,
+    // [r40] 相机原生尺寸（RAW 才有）。工作源小于它时，面板要说明「全尺寸」指的是
+    // 工作源 —— 不说清楚，用户会以为导出被偷偷缩了。
+    nativeW: Int = 0, nativeH: Int = 0,
     // [r11 第 4 批] 命名 token 的三份取值：原片名 / 当前胶片 / 当前相纸。
     // 日期在面板里取"此刻"（= 冲洗日），所以不放参数。
     srcName: String, filmName: String, printName: String,
@@ -281,8 +287,19 @@ fun ExportPanel(
     val lossless = format == ExportFormat.PNG || format == ExportFormat.TIFF
     // [r20] API 28 的 HeifWriter 没有质量参数（只有 API 29+ 的 Builder 有）。
     val heifFixedQuality = format == ExportFormat.HEIF && !HeifExport.supportsQuality
-    val targetW = if (size == 0) sourceW else minOf(sourceW, size)
-    val targetH = (sourceH.toLong() * targetW / maxOf(1, sourceW)).toInt()
+    // [r40] 按「长边」等比缩放，且横向/纵向照片都成立 —— 与导出时实际用的
+    // 缩放算法一致（MainActivity 里按 sizeL.toInt() 缩长边）。
+    val sourceLong = maxOf(sourceW, sourceH)
+    val targetLong = if (size == 0) sourceLong else minOf(sourceLong, EXPORT_SIZE_PX[size])
+    val targetW: Int
+    val targetH: Int
+    if (sourceW >= sourceH) {
+        targetW = targetLong
+        targetH = (sourceH.toLong() * targetLong / maxOf(1, sourceW)).toInt()
+    } else {
+        targetH = targetLong
+        targetW = (sourceW.toLong() * targetLong / maxOf(1, sourceH)).toInt()
+    }
     val effSize = if (format == ExportFormat.UHDR_JPEG) "全尺寸" else EXPORT_SIZES[size]
 
     // 结构（r22）：外层定高，**内容滚动、底部按钮钉住**。
@@ -371,6 +388,12 @@ fun ExportPanel(
             Text("$targetW × $targetH · ${"%.1f".format(targetW * targetH / 1e6f)} MP",
                 color = Dv.label3, fontSize = 10.sp, fontFamily = Dv.mono,
                 modifier = Modifier.padding(start = 60.dp, top = 2.dp))
+            if (nativeW > 0 && nativeH > 0 &&
+                nativeW.toLong() * nativeH > sourceW.toLong() * sourceH * 105 / 100) {
+                Text("相机原生 $nativeW×$nativeH；“全尺寸”= 工作源 $sourceW×$sourceH（本机单块缓冲装不下原生）",
+                    color = Dv.label4, fontSize = 9.5f.sp, lineHeight = 12.sp,
+                    modifier = Modifier.padding(start = 60.dp, end = 16.dp, top = 3.dp))
+            }
         }
         // ---------- 色彩（HDR JPEG 主图固定 sRGB、HEIF 不带 ICC —— 都只按 sRGB 出字节）----------
         if (format != ExportFormat.UHDR_JPEG && format != ExportFormat.HEIF) {

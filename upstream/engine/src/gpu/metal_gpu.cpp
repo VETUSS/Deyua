@@ -734,6 +734,14 @@ public:
         return known ? 16384u : 8192u;
     }
 
+    // Metal has no SSBO range cap of its own: a compute kernel binds a buffer
+    // whole, and the only bound is `maxBufferLength`. Answering a conservative
+    // constant here would make the app render smaller than the device can, so
+    // this is the device's own number.
+    uint64_t storage_range_limit() const override {
+        return static_cast<uint64_t>(device_->maxBufferLength());
+    }
+
     // --- RFC-020 §3.3: what the pool holds --------------------------------
 
     PoolStats pool_stats() const override {

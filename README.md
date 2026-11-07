@@ -11,13 +11,13 @@ Android 端的胶片模拟冲洗应用。导入一张照片，选择胶片与相
 
 安装包发布在 [Releases](https://github.com/VETUSS/Deyua/releases) 页面。最新版本：
 
-**[Deyva v0.8.97-r39](https://github.com/VETUSS/Deyua/releases/download/v0.8.97-r39/Deyva-v0.8.97-r39.apk)** ·
-22,849,696 字节 · Android 7.0+ · arm64-v8a · `com.spektra.android`
+**[Deyva v0.8.98-r40](https://github.com/VETUSS/Deyua/releases/download/v0.8.98-r40/Deyva-v0.8.98-r40.apk)** ·
+22,383,152 字节 · Android 7.0+ · arm64-v8a · `com.spektra.android`
 
 侧载安装，需允许「安装未知来源应用」。下载后可核对完整性：
 
 ```
-SHA-256  067d0e6f03c51fe477da9b8c41ed0ca0567f93888257901bf40be06d71cc4931
+SHA-256  4c10242f5022e4c0bf4fca933ce0a2be439c8ff0347b600135b37b68efbf0165
 ```
 
 从 r32 升级可直接覆盖安装（签名未变）；r29 及更早的包需要先卸载。

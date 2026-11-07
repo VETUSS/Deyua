@@ -2132,6 +2132,22 @@ void diag_probe_image(gpu::Gpu* g, const char* tag, const Image& img) {
     for (int k = 0; k < 5; ++k) diag_addf("%s%.3g", k ? "," : "", diag_lum(v + 3 * k));
     diag_addf("|");
     for (int k = 0; k < 3; ++k) diag_addf("%s%.3g", k ? "," : "", diag_lum(v + 15 + 3 * k));
+    // [r40.3] Eight rows instead of three, down the centre column. A frame that
+    // comes out in horizontal bands is the failure this pipeline keeps meeting,
+    // and three samples at 25/50/75% land inside one band and miss it entirely --
+    // the full-size export that showed three bands of one scene came back with
+    // 25/50/75 all inside the wrong band. Eight at (2k+1)/16 cross every band a
+    // driver-sized split can produce.
+    diag_addf("^");
+    for (int k = 0; k < 8; ++k) {
+        const uint32_t y = std::min(img.h - 1u, uint32_t((2 * k + 1) * double(img.h) / 16.0));
+        if (!g->read(img.buf.get(), (size_t(y) * img.w + col) * 3u * sizeof(float),
+                     v + 3 * k, 3u * sizeof(float), err)) {
+            diag_addf("vread;");
+            return;
+        }
+        diag_addf("%s%.3g", k ? "," : "", diag_lum(v + 3 * k));
+    }
     diag_addf(";");
 }
 
@@ -2203,6 +2219,9 @@ uint32_t Pipeline::choose_strip_height(uint32_t plane_h, uint32_t node_count,
     (void)node_count;
     (void)budget_bytes;
     if (plane_h == 0) return 1;
+    // [r40.5] 回到原语义：0 = 一条带（整帧）。r40.4 曾把它改成自动 1024 行，
+    // 让分带在导出时真的切开 —— 但切开之后执行器丢掉了最后一带，所以那条
+    // 自动门已撤回，这里也跟着回来。
     if (requested_rows == 0 || requested_rows >= plane_h) return plane_h;
     return requested_rows;
 }
@@ -2439,6 +2458,13 @@ bool Pipeline::run_film_striped(const Image& in, Image& out, Progress* progress,
     if (!run_stages_striped(kFilmStages, kFilmStageCount, chain, report.plan, report, error)) {
         return false;
     }
+    // [r40.4] 分带是这次唯一能救 24 MP 导出的东西，所以它自己必须留证：
+    // 几条带、每条带多高、halo 合起来多少行、有几段能带内执行。
+    if (!report.plan.empty()) {
+        diag_addf("STRIP:film %ux%u n=%zu rows=%u runs=%zu halo=%u;", cur.w, cur.h,
+                  report.plan.size(), report.plan.front().rows, report.runs,
+                  report.stages.empty() ? 0u : report.stages.front().halo);
+    }
     if (progress_) progress_->strips.push_back(std::move(report));
     progress_ = nullptr;
     out = chain.cur;
@@ -2510,6 +2536,11 @@ bool Pipeline::run_print_striped(const Image& cmy, Image& out, Progress* progres
     report.plan = strip_plan(cmy.h);
     const bool ok = run_stages_striped(kPrintStages, kPrintStageCount, chain, report.plan, report,
                                        error);
+    if (!report.plan.empty()) {
+        diag_addf("STRIP:print %ux%u n=%zu rows=%u runs=%zu halo=%u;", cmy.w, cmy.h,
+                  report.plan.size(), report.plan.front().rows, report.runs,
+                  report.stages.empty() ? 0u : report.stages.front().halo);
+    }
     release_contrast_mask();
     if (!ok) return false;
     if (progress_) { progress_->strips.push_back(std::move(report)); progress_->done = true; }

@@ -184,6 +184,21 @@ const char* spk_params_schema(spk_engine* engine);
  */
 const char* spk_memory_report(spk_engine* engine);
 
+/* Hand back every idle buffer in the render pool. Returns the bytes freed.
+ *
+ * [DEYVA r40.5] The pool is a cache, not a ledger: `release` only destroys
+ * *persistent* buffers, so an ordinary plane that has gone out of scope keeps
+ * its VkDeviceMemory until something asks for the same size again. That is the
+ * right trade for a preview loop and the wrong one before a full-size export,
+ * where the only thing standing between a 24 MP frame and VK_ERROR_DEVICE_LOST
+ * is how much of the device the process is already holding. Call it first, then
+ * render: the export starts from a clean pool instead of inheriting every
+ * leftover from the thumbnails and previews before it.
+ *
+ * Safe at any time: only buffers with no live reference are destroyed, and the
+ * engine takes the pool lock throughout. */
+size_t spk_trim_pool(spk_engine* engine);
+
 /* Pay the fixed per-stock-pair setup before the user is looking (RFC-013 §3).
  * Idempotent. `out_json` receives the `warm_up` reply. */
 spk_status spk_warm_up(spk_engine* engine, const char* film_stock,
