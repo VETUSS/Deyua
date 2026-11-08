@@ -151,7 +151,7 @@ public:
         }
         VkApplicationInfo app{};
         app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-        app.pApplicationName = "SpektraLab headless";
+        app.pApplicationName = "Deyva headless";
         app.apiVersion = VK_API_VERSION_1_0;
         VkInstanceCreateInfo create{};
         create.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;

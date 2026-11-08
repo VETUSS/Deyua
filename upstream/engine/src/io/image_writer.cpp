@@ -165,7 +165,7 @@ bool write_srgb_tiff_impl(const std::filesystem::path& destination, const uint16
         for (size_t i = 0; i < 3; ++i) { le16(header, bits + 2 * i, 16); le16(header, samples + 2 * i, 1); }
         const uint32_t resolution = payload(8);
         le32(header, resolution, 1); le32(header, resolution + 4, 1);
-        constexpr char software[] = "SpektraLab Windows host";
+        constexpr char software[] = "Deyva Windows host";
         const uint32_t software_at = payload(sizeof software);
         std::memcpy(header.data() + software_at, software, sizeof software);
         const uint32_t icc_at = payload(profile.size());

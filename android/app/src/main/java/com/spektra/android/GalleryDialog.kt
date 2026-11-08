@@ -37,7 +37,7 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
-// ===== 成片相册：只展示本软件冲洗后导出到系统相册(Pictures/SpektraLab)的成片，
+// ===== 成片相册：只展示本软件冲洗后导出到系统相册(Pictures/Deyva)的成片，
 //        全屏大页面，按冲洗时间（日期）分组，符合 iOS 图库风格 =====
 
 data class GalleryPhoto(val uri: Uri, val dateAddedMillis: Long)
@@ -64,7 +64,7 @@ private fun querySpektraPhotos(ctx: Context, hidden: Set<String> = emptySet()): 
     val selection = "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
     ctx.contentResolver.query(
         MediaStore.Images.Media.EXTERNAL_CONTENT_URI, projection, selection,
-        arrayOf("Pictures/SpektraLab/%"), "${MediaStore.Images.Media.DATE_ADDED} DESC"
+        arrayOf("Pictures/Deyva/%"), "${MediaStore.Images.Media.DATE_ADDED} DESC"
     )?.use { c ->
         val idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
         val dateCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)

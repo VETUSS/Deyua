@@ -748,12 +748,12 @@ object Exporter {
                     put(MediaStore.Images.Media.DISPLAY_NAME, name)
                     put(MediaStore.Images.Media.MIME_TYPE, "image/$ext")
                     if (Build.VERSION.SDK_INT >= 29) {
-                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SpektraLab")
+                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Deyva")
                         put(MediaStore.Images.Media.IS_PENDING, 1)
                     } else {
                         @Suppress("DEPRECATION")
                         val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
-                        val f = File(dir, "SpektraLab/$name"); f.parentFile?.mkdirs()
+                        val f = File(dir, "Deyva/$name"); f.parentFile?.mkdirs()
                         put(MediaStore.Images.Media.DATA, f.absolutePath)
                     }
                 }
@@ -765,7 +765,7 @@ object Exporter {
                     resolver.update(uri, values, null, null)
                 }
             } else {
-                val dir = ctx.getExternalFilesDir(null)?.let { File(it, "SpektraLab") } ?: return false to ext
+                val dir = ctx.getExternalFilesDir(null)?.let { File(it, "Deyva") } ?: return false to ext
                 dir.mkdirs()
                 FileOutputStream(uniqueFile(dir, name, ext)).use { it.write(bytes) }
             }
@@ -834,12 +834,12 @@ object Exporter {
                     put(MediaStore.Images.Media.DISPLAY_NAME, fname)
                     put(MediaStore.Images.Media.MIME_TYPE, "image/$ext")
                     if (Build.VERSION.SDK_INT >= 29) {
-                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SpektraLab")
+                        put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Deyva")
                         put(MediaStore.Images.Media.IS_PENDING, 1)
                     } else {
                         @Suppress("DEPRECATION")
                         val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
-                        val f = File(dir, "SpektraLab/$fname"); f.parentFile?.mkdirs()
+                        val f = File(dir, "Deyva/$fname"); f.parentFile?.mkdirs()
                         put(MediaStore.Images.Media.DATA, f.absolutePath)
                     }
                 }
@@ -852,7 +852,7 @@ object Exporter {
                 }
                 true
             } else {
-                val dir = ctx.getExternalFilesDir(null)?.let { File(it, "SpektraLab") } ?: return false
+                val dir = ctx.getExternalFilesDir(null)?.let { File(it, "Deyva") } ?: return false
                 dir.mkdirs()
                 FileOutputStream(uniqueFile(dir, name, ext)).use { it.write(bytes) }
                 true
@@ -938,7 +938,7 @@ object Exporter {
         return null
     }
 
-    // 给 PNG 追加 tEXt 文本块（keyword=SpektraLab，含成片配方）
+    // 给 PNG 追加 tEXt 文本块（keyword=Deyva，含成片配方）
     private fun applyPngText(png: ByteArray, keyword: String, text: String): ByteArray {
         return runCatching {
             // 找 IEND chunk（结尾 12 字节：00 00 00 00 49 45 4E 44 AE 42 60 82）
