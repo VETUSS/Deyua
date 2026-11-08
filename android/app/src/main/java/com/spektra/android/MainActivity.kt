@@ -334,6 +334,8 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
     var tab by remember { mutableIntStateOf(0) }
     var showLog by remember { mutableStateOf(false) }
     var showGallery by remember { mutableStateOf(false) }
+    // 观片台：从相册进入时把列表带过来，退出后回到相册
+    var lightTablePhotos by remember { mutableStateOf<List<GalleryPhoto>?>(null) }
     // [r30] 「关于」现在是独立面板：构建校验状态 + 两份许可证全文 + 源码入口
     var showAbout by remember { mutableStateOf(false) }
     // ===== 配方持久化（r11，第 0 批）=====
@@ -2811,7 +2813,13 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
             }) { Text("复制全文", color = Orange) } },
             dismissButton = { TextButton({ showLog = false }) { Text("关闭", color = Dv.label2) } })
     }
-    if (showGallery) GalleryPage(onClose = { showGallery = false })
+    if (showGallery) GalleryPage(
+        onClose = { showGallery = false },
+        onOpenLightTable = { list -> lightTablePhotos = list; showGallery = false }
+    )
+    lightTablePhotos?.let { list ->
+        LightTablePage(list, onClose = { lightTablePhotos = null; showGallery = true })
+    }
 
     DisposableEffect(Unit) { onDispose { val e = engine; if (session != 0L) e?.sessionRelease(session); e?.destroy() } }
 }

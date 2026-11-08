@@ -77,7 +77,7 @@ private fun querySpektraPhotos(ctx: Context, hidden: Set<String> = emptySet()): 
     return list
 }
 
-private suspend fun loadScaled(ctx: Context, uri: Uri, edge: Int): Bitmap? = withContext(Dispatchers.IO) {
+internal suspend fun loadScaled(ctx: Context, uri: Uri, edge: Int): Bitmap? = withContext(Dispatchers.IO) {
     runCatching {
         if (android.os.Build.VERSION.SDK_INT >= 29) {
             runCatching { ctx.contentResolver.loadThumbnail(uri, android.util.Size(edge, edge), null) }
@@ -129,7 +129,7 @@ private fun dayLabel(ts: Long): String {
 
 // 全屏玻璃导航栏（圆角毛玻璃卡片，与主界面顶栏/按钮统一圆角语言）
 @Composable
-private fun GalleryTopBar(title: String, subtitle: String?, onBack: () -> Unit) {
+private fun GalleryTopBar(title: String, subtitle: String?, onBack: () -> Unit, trailing: @Composable (() -> Unit)? = null) {
     Column(Modifier.fillMaxWidth().padding(start = 10.dp, top = 8.dp, end = 10.dp, bottom = 4.dp)) {
         Row(Modifier.fillMaxWidth().height(52.dp).clip(RoundedCornerShape(18.dp)).background(Dv.glassBar).padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             // [r13] 返回键 44dp 触控区 + 按下变暗（原来 16sp 裸文字，可点高度约 20dp）
@@ -141,13 +141,14 @@ private fun GalleryTopBar(title: String, subtitle: String?, onBack: () -> Unit) 
             Spacer(Modifier.width(4.dp))
             Text(title, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.weight(1f))
+            if (trailing != null) trailing()
             if (subtitle != null) Text(subtitle, color = Dv.label2, fontSize = 12.sp, modifier = Modifier.padding(end = 8.dp))
         }
     }
 }
 
 @Composable
-fun GalleryPage(onClose: () -> Unit) {
+fun GalleryPage(onClose: () -> Unit, onOpenLightTable: (List<GalleryPhoto>) -> Unit = {}) {
     val ctx = LocalContext.current
     var photos by remember { mutableStateOf<List<GalleryPhoto>>(emptyList()) }
     var loaded by remember { mutableStateOf(false) }
@@ -181,7 +182,7 @@ fun GalleryPage(onClose: () -> Unit) {
                 if (selected != null) {
                     val ph = selected!!
                     LaunchedEffect(ph.uri) { selectedBmp = loadScaled(ctx, ph.uri, 1600) }
-                    GalleryTopBar("成片", null) { selected = null }
+                    GalleryTopBar("成片", null, onBack = { selected = null })
                     Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black), contentAlignment = Alignment.Center) {
                         val b = if (hdrOn && hdrBmp != null) hdrBmp else selectedBmp
                         if (b != null) Image(b.asImageBitmap(), "成片预览", Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
@@ -209,7 +210,19 @@ fun GalleryPage(onClose: () -> Unit) {
                     }
                 } else {
                     // 相册网格页
-                    GalleryTopBar("相册", if (loaded) "共 ${photos.size} 张成片" else null) { onClose() }
+                    GalleryTopBar("相册", if (loaded) "共 ${photos.size} 张成片" else null, { onClose() }) {
+                        if (photos.isNotEmpty()) {
+                            Box(
+                                Modifier.height(34.dp).clip(RoundedCornerShape(11.dp))
+                                    .background(Orange.copy(alpha = 0.18f))
+                                    .padding(horizontal = 12.dp)
+                                    .iosTap(pressDim = 0.6f, haptic = true) { onOpenLightTable(photos) },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("观片台", color = Orange, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                    }
                     when {
                         !loaded -> Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = Orange) }
                         photos.isEmpty() -> Column(Modifier.weight(1f).fillMaxWidth().padding(vertical = 40.dp), horizontalAlignment = Alignment.CenterHorizontally) {
