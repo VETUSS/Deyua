@@ -4,7 +4,6 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.net.Uri
-import android.os.Build
 import android.view.WindowManager
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
@@ -51,7 +50,11 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -66,7 +69,9 @@ import kotlinx.coroutines.withContext
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
+import kotlin.math.ceil
 import kotlin.math.cos
+import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -111,6 +116,7 @@ private data class LtPlate(
 private const val LT_BASE_W = 0.64f      // 单张片基准宽度 = 加入时灯箱宽 × 0.64
 private const val LT_MAX = 30            // 灯箱最多 30 张
 private const val LT_STRIP_MAX = 12      // 一条片条最多 12 格
+private const val LT_WORLD_LIMIT = 20_000f   // 世界坐标的安全边界（dp），不是可视边界
 
 private val LtPad = 6.dp                 // 灯箱面到画布边的距离（留给光晕）
 private val LtRadius = 28.dp
@@ -154,18 +160,32 @@ fun LightTablePage(
     var loupeZoom by remember { mutableStateOf(2f) }
     var loupeFocus by remember { mutableStateOf(Offset(-1f, -1f)) }
     var boardSize by remember { mutableStateOf(Size.Zero) }
+    // ---- 无限画布（r46）----
+    // 灯箱不再只有一屏大：整个台面可以平移，片子摆到屏幕外就"在更远的地方"，
+    // 想要多大的版式就拼多大。平移量存在**视口**这一侧（panX / panY，单位 dp），
+    // 片子自己的 cxDp / cyDp 是世界坐标，谁也不改谁。
+    // 亚克力面板本身不跟着动 —— 它现在是"无限大的一块灯板"，动的是板上的东西。
+    var panX by remember { mutableFloatStateOf(0f) }
+    var panY by remember { mutableFloatStateOf(0f) }
+    val panNow by rememberUpdatedState(Offset(panX, panY))
+    // 平移过就显示"归位"：不然拖远了会不知道怎么找回中间
+    fun resetView() { panX = 0f; panY = 0f }
     var fullscreen by remember { mutableStateOf(false) }
     // 全屏工具条：进来先露一下，几秒后自己收走，空白处轻点再叫出来。
     // 全屏就是为了把灯箱铺满，工具不该长期占着画面底部。
     var barOn by remember { mutableStateOf(true) }
     // 灯箱的灯：真实观片台是可以关灯的——关掉以后亚克力面板只剩室内光，
     // 负片立刻变成一片暗，只剩形状和一点反光。0 = 全暗，1 = 全亮。
+    // 灯丝的亮起/熄灭不是开关量：给 1.2 秒，中间还会经过一段偏暖的低亮度。
     var lightOn by remember { mutableStateOf(true) }
     val light by animateFloatAsState(
         targetValue = if (lightOn) 1f else 0f,
-        animationSpec = tween(durationMillis = 460, easing = FastOutSlowInEasing),
+        animationSpec = tween(durationMillis = 1200, easing = FastOutSlowInEasing),
         label = "light"
     )
+    // 灯箱边上的刻度尺（上边横向、左边纵向），拟真用的
+    var rulerOn by remember { mutableStateOf(false) }
+    val textMeasurer = rememberTextMeasurer()
     val bitmaps = remember { mutableStateMapOf<String, ImageBitmap>() }
     // 每张图的真实画幅比。格子必须按它放图：AR 一旦取错，绘制时就会把片边、
     // 片码裁掉——裁掉之后再挖齿孔，就成了"裁掉真片边、自己画假孔"。
@@ -182,6 +202,17 @@ fun LightTablePage(
     var hdrOn by remember { mutableStateOf(false) }
     var glow by remember { mutableStateOf<ImageBitmap?>(null) }
 
+    // 侧边手势 / 返回键：一层一层退（选片抽屉 → 全屏 → 取消选中 → 回相册）。
+    // 不接住的话会落到 Activity 的默认行为上直接 finish —— 从观片台一滑就回桌面。
+    DvBackHandler {
+        when {
+            pickerOpen -> pickerOpen = false
+            fullscreen -> fullscreen = false
+            selectedId != null -> selectedId = null
+            else -> onClose()
+        }
+    }
+
     DisposableEffect(act) {
         val w = act?.window
         w?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -193,34 +224,12 @@ fun LightTablePage(
         }
     }
 
-    // 内容要能画到状态栏/挖孔区下面，否则窗口本身还被系统栏占着，全屏时灯箱
-    // 上边永远留一条黑。观片台退出时恢复，主界面照旧。
+    // r47.1：**不再碰窗口的布局模式**。
     //
-    // 只关 decorFits 还不够：默认的挖孔模式（DEFAULT）会为了让开前摄挖孔，把
-    // 竖屏的顶部整条留出来——于是状态栏收起来了，那条黑还在。必须显式声明
-    // shortEdges，内容才允许铺进挖孔区。
-    DisposableEffect(act) {
-        val w = act?.window
-        var prevCut = Int.MIN_VALUE
-        if (w != null) {
-            WindowCompat.setDecorFitsSystemWindows(w, false)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                prevCut = w.attributes.layoutInDisplayCutoutMode
-                w.attributes = w.attributes.apply {
-                    layoutInDisplayCutoutMode =
-                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                }
-            }
-        }
-        onDispose {
-            if (w != null) {
-                WindowCompat.setDecorFitsSystemWindows(w, true)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && prevCut != Int.MIN_VALUE) {
-                    w.attributes = w.attributes.apply { layoutInDisplayCutoutMode = prevCut }
-                }
-            }
-        }
-    }
+    // 这里原本在进入时切 edge-to-edge、退出时切回 fit。切回来那一下，系统不会立刻
+    // 重发 insets，主界面的 Scaffold 仍按"状态栏被系统占着"来让位，等于让了两遍 ——
+    // 顶栏就往下掉一截，要转屏或重启才回得去。现在 edge-to-edge 和挖孔模式都在
+    // Activity 启动时定死，观片台只负责显隐系统栏，退出后主界面一个像素都不会动。
 
     // 全屏：收起系统栏，灯箱铺满整屏；退出时还给系统
     DisposableEffect(fullscreen) {
@@ -269,9 +278,11 @@ fun LightTablePage(
             return
         }
         val n = plates.size
-        // 位置按 dp 错开：新片子落下来不会正好压住上一张
-        val ox = ((n % 3) - 1) * 20f
-        val oy = ((n % 4) - 1.5f) * 24f
+        // 位置按 dp 错开：新片子落下来不会正好压住上一张。
+        // 基准是**当前视口的中心**（-pan），所以平移到别处再添加，片子就落在眼前，
+        // 不会掉回原点那个已经看不见的老中心。
+        val ox = -panX + ((n % 3) - 1) * 20f
+        val oy = -panY + ((n % 4) - 1.5f) * 24f
         val id = nextId
         plates = plates + LtPlate(
             id = id,
@@ -286,6 +297,8 @@ fun LightTablePage(
         )
         nextId = id + 1
         selectedId = id
+        // 第一张落下来时给一句操作提示（以前这行字常驻底栏，占地方）
+        if (n == 0) hint = "点住片子可拖动 · 双指缩放旋转 · 双指拖空白移画布"
     }
 
     fun updatePlate(id: Long, f: (LtPlate) -> LtPlate) {
@@ -340,24 +353,15 @@ fun LightTablePage(
     }
 
     // 灯箱尺寸变了（转屏 / 进出全屏 / 全屏收起系统栏）：片子本身不动，只把
-    // 会被切在灯箱外的片收回来——这是"转屏不跳"与"不丢片"之间唯一的取舍
+    // 会被切在灯箱外的片收回来——这是"转屏不跳"与"不丢片"之间唯一的取舍。
+    //
+    // r46 起有无限画布了：灯箱之外不再等于"看不见"，所以这里的边界放到
+    // ±[LT_WORLD_LIMIT] dp 这个纯粹的数值安全区，正常的摆法一根手指都碰不到它。
     LaunchedEffect(boardSize, fullscreen) {
         if (boardSize.width <= 0f) return@LaunchedEffect
-        val pad = if (fullscreen) 0f else with(density) { LtPad.toPx() }
-        val innerW = max(1f, boardSize.width - pad * 2f)
-        val innerH = max(1f, boardSize.height - pad * 2f)
         plates = plates.map { p ->
-            val w = plateWpx(p, dens)
-            val h = plateHpx(p, dens)
-            val a = Math.toRadians(p.rot.toDouble())
-            val ca = abs(cos(a)).toFloat()
-            val sa = abs(sin(a)).toFloat()
-            val hx = (ca * w + sa * h) / 2f
-            val hy = (sa * w + ca * h) / 2f
-            val mx = max(0f, innerW / 2f - hx) / dens
-            val my = max(0f, innerH / 2f - hy) / dens
-            val nx = p.cxDp.coerceIn(-mx, mx)
-            val ny = p.cyDp.coerceIn(-my, my)
+            val nx = p.cxDp.coerceIn(-LT_WORLD_LIMIT, LT_WORLD_LIMIT)
+            val ny = p.cyDp.coerceIn(-LT_WORLD_LIMIT, LT_WORLD_LIMIT)
             if (nx == p.cxDp && ny == p.cyDp) p else p.copy(cxDp = nx, cyDp = ny)
         }
     }
@@ -379,15 +383,14 @@ fun LightTablePage(
     }
 
     // 手指停稳再取高清：拖动过程中不去抢解码带宽
-    LaunchedEffect(loupeOn, loupeFocus, boardSize, plates.size) {
+    LaunchedEffect(loupeOn, loupeFocus, boardSize, plates.size, panX, panY) {
         if (!loupeOn || boardSize.width <= 0f) {
             hiBmp = null
             hiUri = null
             return@LaunchedEffect
         }
         delay(150)
-        val pad = if (fullscreen) 0f else with(density) { LtPad.toPx() }
-        val idx = hitPlate(loupeFocus, plates, boardSize, dens, pad)
+        val idx = hitPlate(loupeFocus, plates, boardSize, dens, panNow)
         val p = idx?.let { plates[it] }
         val u = if (p != null && p.frames.size == 1) p.frames[0].toString() else null
         if (u == null) {
@@ -448,6 +451,11 @@ fun LightTablePage(
                             modifier = Modifier.padding(end = 8.dp)
                         )
                     }
+
+                    // 灯箱本体的两个开关：刻度尺、灯。放在顶栏是因为它们是"台面"的
+                    // 设置，和底栏那几个"看片工具"不是一类东西
+                    LtTopChip(if (rulerOn) "刻度 · 开" else "刻度", rulerOn) { rulerOn = !rulerOn }
+                    LtTopChip(if (lightOn) "关灯" else "开灯", !lightOn) { lightOn = !lightOn }
 
                     // 视觉 32dp、触控 44dp：顶栏的按钮要够大，不然容易点偏
                     Box(
@@ -516,7 +524,7 @@ fun LightTablePage(
                                     return@awaitEachGesture
                                 }
 
-                                val hitIdx = hitPlate(down.position, plates, boardSize, dens, pad)
+                                val hitIdx = hitPlate(down.position, plates, boardSize, dens, panNow, innerRect(boardSize, pad))
                                 val dragId = hitIdx?.let { plates[it].id }
                                 // 先提到最前再拖：手指按下的那张就该压在上面
                                 dragId?.let { raisePlate(it) }
@@ -527,6 +535,19 @@ fun LightTablePage(
                                 var lastAngle = 0f
                                 var multi = false
                                 var travel = 0f
+                                // 空白处拖的是**画布**，而且只认双指（r47）。
+                                //
+                                // 单指在空白上按着走什么都不做：这一版之前单指也能推画布，
+                                // 结果"点一下想把工具条叫出来"经常被判成一次小幅平移，
+                                // 抬手时台面已经偏了 —— 那是最让人火的一种误操作。
+                                // 现在单指在空白处只可能是"轻点"，双指才是"我确实要移台面"，
+                                // 跟片子上的双指（缩放/旋转）也不会打架：那必须压在片子上。
+                                var px = panNow.x
+                                var py = panNow.y
+                                var multiC = Offset.Zero
+                                // 画布真的被推动过没有：双指平移时 travel 不增长，
+                                // 不加这个标记，一次双指轻推会被当成"轻点空白"
+                                var panned = false
                                 down.consume()
 
                                 while (true) {
@@ -534,12 +555,46 @@ fun LightTablePage(
                                     val pressed = ev.changes.filter { it.pressed }
                                     if (pressed.isEmpty()) break
 
+                                    if (dragId == null) {
+                                        // ---- 移画布（只认双指）----
+                                        if (pressed.size >= 2) {
+                                            // 用多指的中心推：两指同向拖 = 平移，
+                                            // 两指各走各的也不会把画布抖成两倍速度
+                                            val c = pressed
+                                                .fold(Offset.Zero) { acc, ch -> acc + ch.position } /
+                                                pressed.size.toFloat()
+                                            if (multi && multiC != Offset.Zero) {
+                                                val dlt = c - multiC
+                                                if (dlt.getDistance() > 0f) panned = true
+                                                px += dlt.x / dens
+                                                py += dlt.y / dens
+                                                panX = px
+                                                panY = py
+                                            }
+                                            multiC = c
+                                            multi = true
+                                        } else {
+                                            // 单指：只记位移，不动画布。抬手时位移小的算轻点
+                                            val pos = pressed[0].position
+                                            travel = max(travel, (pos - down.position).getDistance())
+                                            if (multi) {
+                                                // 从双指收回到单指：重新立足，剩下那根手指
+                                                // 要是继续走，就当成新的一次单指（不动画布）
+                                                multi = false
+                                                multiC = Offset.Zero
+                                                last = pos
+                                            }
+                                        }
+                                        ev.changes.forEach { it.consume() }
+                                        continue
+                                    }
+
                                     if (pressed.size >= 2) {
                                         val a = pressed[0].position
                                         val b = pressed[1].position
                                         val dist = (b - a).getDistance()
                                         val ang = atan2(b.y - a.y, b.x - a.x) * 180f / PI.toFloat()
-                                        if (lastDist > 0f && dragId != null) {
+                                        if (lastDist > 0f) {
                                             val z = (dist / lastDist).coerceIn(0.88f, 1.14f)
                                             val dr = ang - lastAngle
                                             updatePlate(dragId) {
@@ -559,17 +614,17 @@ fun LightTablePage(
                                             multi = false
                                             lastDist = 0f
                                             last = pos
-                                        } else if (dragId != null) {
-                                            val inner = innerOf(boardSize, pad)
+                                        } else {
                                             val dx = (pos.x - last.x) / dens
                                             val dy = (pos.y - last.y) / dens
-                                            // 片心不许走出灯箱：转屏 / 全屏时不至于有片再也够不着
-                                            val mx = inner.width / 2f / dens
-                                            val my = inner.height / 2f / dens
+                                            // 只挡数值溢出，不挡"摆到屏幕外" —— 无限画布上
+                                            // 片子本来就该能放到视口之外，稍后平移过去看
                                             updatePlate(dragId) {
                                                 it.copy(
-                                                    cxDp = (it.cxDp + dx).coerceIn(-mx, mx),
-                                                    cyDp = (it.cyDp + dy).coerceIn(-my, my)
+                                                    cxDp = (it.cxDp + dx)
+                                                        .coerceIn(-LT_WORLD_LIMIT, LT_WORLD_LIMIT),
+                                                    cyDp = (it.cyDp + dy)
+                                                        .coerceIn(-LT_WORLD_LIMIT, LT_WORLD_LIMIT)
                                                 )
                                             }
                                             last = pos
@@ -579,7 +634,7 @@ fun LightTablePage(
                                 }
 
                                 // 空白处轻点（不是拖）：全屏时把工具条叫出来或收回去
-                                if (hitIdx == null && travel <= 6.dp.toPx() && fullscreen) {
+                                if (hitIdx == null && !panned && travel <= 6.dp.toPx() && fullscreen) {
                                     barOn = !barOn
                                 }
                             }
@@ -590,31 +645,61 @@ fun LightTablePage(
                     val pad = if (fullscreen) 0f else LtPad.toPx()
                     val rad = if (fullscreen) 0f else LtRadius.toPx()
 
-                    fun DrawScope.paintScene(cullC: Offset?, cullR: Float) {
-                        drawLightBox(pad, rad, glow, light)
-                        plates.forEach { p ->
-                            val c = plateCenter(p, size, dens)
-                            val w = plateWpx(p, dens)
-                            val h = plateHpx(p, dens)
-                            if (cullC != null) {
-                                // 只画镜内能看见的片：抬镜时灯箱上可能有 30 张
-                                val diag = hypot(w, h) / 2f
-                                if ((c - cullC).getDistance() > cullR + diag) return@forEach
+                    // 片子只画在灯箱面之内。
+                    //
+                    // 这是"无限画布"最要紧的一笔：台面是一块很大的亚克力，片子是摆在
+                    // 台面上的实物，所以片子的可见范围就是灯箱面本身。把片子往边上
+                    // 平移，它是**从边上滑出去**（被灯箱的边框切掉），不是浮在黑底上 ——
+                    // 反过来拖回来，切掉的那一半就跟着回来。画布照旧可以一直往外走。
+                    fun DrawScope.paintScene(cullC: Offset?, cullR: Float, clipHere: Boolean = true) {
+                        // 面板不跟着平移：它现在是"无限大的一块灯板"，移的是板上的东西。
+                        // 只有刻度尺跟着走 —— 刻度是印在亚克力上的，动了才看得出画布在动
+                        drawLightBox(pad, rad, glow, light, rulerOn, textMeasurer, panNow)
+                        // 放大镜那一趟是在已经变换过的坐标系里重画整场，裁剪得由调用方
+                        // 在屏幕坐标里做（否则会被 scale 一起放大）；这里可以跳过
+                        val board = innerRect(size, pad)
+                        val body: DrawScope.() -> Unit = {
+                            plates.forEach { p ->
+                                val c = plateCenter(p, size, dens, panNow)
+                                val w = plateWpx(p, dens)
+                                val h = plateHpx(p, dens)
+                                if (cullC != null) {
+                                    // 只画镜内能看见的片：抬镜时灯箱上可能有 30 张
+                                    val diag = hypot(w, h) / 2f
+                                    if ((c - cullC).getDistance() > cullR + diag) return@forEach
+                                }
+                                // 整张都在灯箱外就整块跳过：30 张片摆满一张无限画布时，
+                                // 这一句省下的不只是绘制，还有每帧的位图采样
+                                val rad0 = Math.toRadians(p.rot.toDouble())
+                                val ca = abs(cos(rad0)).toFloat()
+                                val sa = abs(sin(rad0)).toFloat()
+                                val hx = (ca * w + sa * h) / 2f
+                                val hy = (sa * w + ca * h) / 2f
+                                if (c.x + hx < board.left || c.x - hx > board.right ||
+                                    c.y + hy < board.top || c.y - hy > board.bottom
+                                ) return@forEach
+                                val imgs = p.frames.map { u ->
+                                    val k = u.toString()
+                                    if (hiBmp != null && k == hiUri) hiBmp else bitmaps[k]
+                                }
+                                val holes = p.frames.map { perfs[it.toString()] }
+                                drawPlate(
+                                    imgs = imgs,
+                                    holes = holes,
+                                    glow = glow,
+                                    c = c, w = w, ars = p.ars, rot = p.rot,
+                                    selected = p.id == selectedId,
+                                    dim = 1f - light
+                                )
                             }
-                            val imgs = p.frames.map { u ->
-                                val k = u.toString()
-                                if (hiBmp != null && k == hiUri) hiBmp else bitmaps[k]
-                            }
-                            val holes = p.frames.map { perfs[it.toString()] }
-                            drawPlate(
-                                imgs = imgs,
-                                holes = holes,
-                                glow = glow,
-                                c = c, w = w, ars = p.ars, rot = p.rot,
-                                selected = p.id == selectedId,
-                                dim = 1f - light
-                            )
                         }
+                        // 用**圆角**裁剪，不是矩形：灯箱四个角是弧的，矩形裁剪会让片子
+                        // 在角落伸出一个尖角（正是那圈弧没盖住的地方）。全屏时 rad = 0，
+                        // 退化成矩形，不用分支。
+                        val boardPath = Path().apply {
+                            addRoundRect(RoundRect(board, CornerRadius(rad)))
+                        }
+                        if (clipHere) clipPath(boardPath) { body() } else body()
                     }
 
                     paintScene(null, 0f)
@@ -651,10 +736,18 @@ fun LightTablePage(
                         )
 
                         clipPath(oval) {
-                            // 取样点 → 镜心：把手指下方的像素搬到镜片正中再放大
-                            translate(lens.x - k * loupeFocus.x, lens.y - k * loupeFocus.y) {
-                                scale(k, k, pivot = Offset.Zero) {
-                                    paintScene(loupeFocus, r / k * 1.6f + 4f)
+                            // 镜片里也只照灯箱面上有的东西：片子滑出去了，放大镜里也该空着。
+                            // 同样按圆角裁 —— 放大镜照到角落时，弧外的部分不该出现
+                            val bd = innerRect(size, pad)
+                            val bdPath = Path().apply {
+                                addRoundRect(RoundRect(bd, CornerRadius(rad)))
+                            }
+                            clipPath(bdPath) {
+                                // 取样点 → 镜心：把手指下方的像素搬到镜片正中再放大
+                                translate(lens.x - k * loupeFocus.x, lens.y - k * loupeFocus.y) {
+                                    scale(k, k, pivot = Offset.Zero) {
+                                        paintScene(loupeFocus, r / k * 1.6f + 4f, clipHere = false)
+                                    }
                                 }
                             }
                             // 镜内边缘极轻的压暗，圆边才有"玻璃厚度"
@@ -738,9 +831,6 @@ fun LightTablePage(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     LtChip("放大镜", loupeOn) { loupeOn = !loupeOn }
-                    // 灯箱的开关。关掉以后亚克力还在，负片暗下去——用来判断
-                    // "这张片子到底是厚还是没吃够光"，也是真实观片台上的习惯动作
-                    LtChip(if (lightOn) "关灯" else "开灯", !lightOn) { lightOn = !lightOn }
                     if (loupeOn) {
                         LtChip("${loupeZoom.toInt()}×") {
                             loupeZoom = when {
@@ -756,26 +846,32 @@ fun LightTablePage(
                         barOn = true
                         hint = "轻点空白处可唤出工具条"
                     }
+                    // 画布平移过才出现：没移过的时候留一个永远不亮的按钮只会占地方
+                    if (panX != 0f || panY != 0f) {
+                        LtChip("归位") {
+                            resetView()
+                            hint = "画布已回到中间"
+                        }
+                    }
                     Spacer(Modifier.weight(1f))
-                    val h = hint
-                    when {
-                        h != null -> Text(h, color = Orange, fontSize = 11.sp)
-                        selectedId != null -> {
-                            LtChip("居中") {
-                                selectedId?.let { id ->
-                                    updatePlate(id) { it.copy(scale = 1f, rot = 0f, cxDp = 0f, cyDp = 0f) }
+                    // 选中片子时才出现的两个动作。其余时间底栏只留按钮，
+                    // 拖放提示改为进页面时的一句浮层，不再长期占着一行字
+                    if (hint == null && selectedId != null) {
+                        LtChip("居中") {
+                            selectedId?.let { id ->
+                                // 落到**当前**视口中心，不是世界原点：平移过之后原点
+                                // 早就不知道飘到哪儿去了
+                                updatePlate(id) {
+                                    it.copy(scale = 1f, rot = 0f, cxDp = -panX, cyDp = -panY)
                                 }
                             }
-                            LtChip("移除", danger = true) {
-                                selectedId?.let { id -> plates = plates.filterNot { it.id == id } }
-                                selectedId = null
-                            }
                         }
-                        plates.isNotEmpty() -> Text(
-                            "可拖动 · 双指缩放",
-                            color = Dv.label3, fontSize = 11.sp
-                        )
+                        LtChip("移除", danger = true) {
+                            selectedId?.let { id -> plates = plates.filterNot { it.id == id } }
+                            selectedId = null
+                        }
                     }
+                    hint?.let { Text(it, color = Orange, fontSize = 11.sp) }
                 }
             } else if (!fullscreen) {
                 Column(
@@ -958,6 +1054,16 @@ fun LightTablePage(
                             lightOn = !lightOn
                             barOn = true
                         }
+                        LtMini(if (rulerOn) "刻度 · 开" else "刻度", rulerOn) {
+                            rulerOn = !rulerOn
+                            barOn = true
+                        }
+                        if (panX != 0f || panY != 0f) {
+                            LtMini("归位", false) {
+                                resetView()
+                                barOn = true
+                            }
+                        }
                         if (loupeOn) {
                             LtMini("${loupeZoom.toInt()}×", true) {
                                 loupeZoom = when {
@@ -988,8 +1094,18 @@ private fun innerOf(size: Size, pad: Float): Size =
 private fun innerRect(size: Size, pad: Float): Rect =
     Rect(pad, pad, size.width - pad, size.height - pad)
 
-private fun plateCenter(p: LtPlate, size: Size, dens: Float): Offset =
-    Offset(size.width / 2f + p.cxDp * dens, size.height / 2f + p.cyDp * dens)
+/**
+ * 片心在屏幕上的位置 = 灯箱中心 + 片的世界坐标 + 画布平移。
+ *
+ * 引入无限画布（r46）之后，片子的 cxDp / cyDp 是**世界坐标**：转屏、平移都不改它，
+ * 改的只是 [pan]。这样"把片子拖出屏幕外再拖回来"能原样回来，转一圈屏也不会
+ * 把摆好的版面揉掉。
+ */
+private fun plateCenter(p: LtPlate, size: Size, dens: Float, pan: Offset = Offset.Zero): Offset =
+    Offset(
+        size.width / 2f + (p.cxDp + pan.x) * dens,
+        size.height / 2f + (p.cyDp + pan.y) * dens,
+    )
 
 private fun clampToBoard(pos: Offset, size: Size, pad: Float, r: Float): Offset {
     if (size.width <= 0f) return pos
@@ -1019,11 +1135,17 @@ private fun lensCenter(focus: Offset, r: Float, inner: Rect): Offset {
 }
 
 /** 命中测试：从最上层往下找，把点逆旋转到片子本地坐标再判矩形 */
-private fun hitPlate(pos: Offset, plates: List<LtPlate>, size: Size, dens: Float, pad: Float): Int? {
+private fun hitPlate(
+    pos: Offset, plates: List<LtPlate>, size: Size, dens: Float,
+    pan: Offset = Offset.Zero, board: Rect? = null,
+): Int? {
     if (size.width <= 0f) return null
+    // 点在灯箱面之外（那圈黑框里）什么也没点中：片子是被灯箱裁过的，
+    // 看不见的那一半就不该还能点到 —— 否则会把一张"已经滑出去的片"拖回来
+    if (board != null && !board.contains(pos)) return null
     for (i in plates.indices.reversed()) {
         val p = plates[i]
-        val c = plateCenter(p, size, dens)
+        val c = plateCenter(p, size, dens, pan)
         val w = plateWpx(p, dens)
         val h = plateHpx(p, dens)
         val a = Math.toRadians(-p.rot.toDouble())
@@ -1048,7 +1170,15 @@ private fun hitPlate(pos: Offset, plates: List<LtPlate>, size: Size, dens: Float
  * 乳白亚克力——不是黑屏。真实灯箱断电就是这个样子：亚克力还是灰白的，负片却
  * 暗下去。所以点亮的部分整体乘 level，底下的亚克力始终在。
  */
-private fun DrawScope.drawLightBox(pad: Float, radius: Float, tile: ImageBitmap?, level: Float) {
+private fun DrawScope.drawLightBox(
+    pad: Float,
+    radius: Float,
+    tile: ImageBitmap?,
+    level: Float,
+    ruler: Boolean,
+    tm: TextMeasurer?,
+    pan: Offset = Offset.Zero,
+) {
     val r = Rect(pad, pad, size.width - pad, size.height - pad)
     if (r.width <= 0f || r.height <= 0f) return
 
@@ -1137,7 +1267,116 @@ private fun DrawScope.drawLightBox(pad: Float, radius: Float, tile: ImageBitmap?
                 alpha = level
             )
         }
+
+        // 灯丝的余温：亮到一半时偏暖，全亮或全灭时都不暖。真实灯箱的灯管
+        // 在起亮和熄灭的中间状态就是这种橘色，不是简单的线性淡入淡出。
+        if (level in 0.01f..0.985f) {
+            val warm = sin(PI.toFloat() * level) * (1f - level)
+            if (warm > 0.002f) {
+                drawRect(
+                    color = Color(0xFFFF9A3C).copy(alpha = 0.30f * warm),
+                    topLeft = r.topLeft,
+                    size = r.size
+                )
+            }
+        }
+
+        if (ruler) drawBoardRuler(r, tm, pan)
     }
+}
+
+/**
+ * 灯箱边上的刻度尺：上边一条横向、左边一条纵向，就像真实观片台贴的那把钢尺。
+ *
+ * 整块灯箱按 300 mm 宽的工作台算，所以 5 mm 一小格、10 mm 中格、50 mm 长格带数字；
+ * 两个方向共用同一套 mm 尺度，格子才是方的。刻度画在灯箱面之上、片子之下——
+ * 片子摆上去会盖住刻度，本来就该这样。
+ */
+private fun DrawScope.drawBoardRuler(r: Rect, tm: TextMeasurer?, pan: Offset = Offset.Zero) {
+    val mm = r.width / 300f
+    if (mm <= 0.4f) return
+    val band = 20.dp.toPx()
+    // 亚克力上印的墨：偏暖的黑，不能是纯黑（纯黑在灯箱上像贴图）
+    val ink = Color(0xFF2B2620)
+    val major = max(6f, 1.dp.toPx() * 0.9f)
+    val minor = max(4f, 1.dp.toPx() * 0.5f)
+
+    // 横向：贴着上边，刻度向下伸。
+    //
+    // 刻度是**印在亚克力上**的，所以它跟着画布一起走（r46 的无限画布）：平移时
+    // 刻度和数字整体滑动，这正是"台面在动、我在上面挪"的体感；不跟着走的话，
+    // 画布移动就完全没有参照物了。原点 0 在进场时的左上角，往负方向也照样标。
+    val x0 = floor((-pan.x / mm) / 5f).toInt() * 5
+    val x1 = ceil((r.width - pan.x) / mm / 5f).toInt() * 5
+    for (i in x0..x1 step 5) {
+        val x = r.left + i * mm + pan.x
+        if (x < r.left - 0.5f || x > r.right - 0.5f) continue
+        val long = i % 50 == 0
+        val len = when {
+            long -> major * 2.2f
+            i % 10 == 0 -> major * 1.4f
+            else -> minor
+        }
+        drawLine(
+            color = ink.copy(alpha = if (long) 0.62f else 0.40f),
+            start = Offset(x, r.top),
+            end = Offset(x, r.top + len),
+            strokeWidth = if (long) 1.1.dp.toPx() else 0.8.dp.toPx()
+        )
+        if (long && tm != null && i != 0) {
+            val label = i.toString()
+            val t = tm.measure(
+                label,
+                TextStyle(color = ink.copy(alpha = 0.55f), fontSize = 7.5.sp, fontWeight = FontWeight.Medium)
+            )
+            drawText(t, topLeft = Offset(x + 2.dp.toPx(), r.top + len + 1.dp.toPx()))
+        }
+    }
+    // 半透明压边，让刻度贴住灯箱边而不飘在画面上
+    drawRect(
+        brush = Brush.verticalGradient(
+            listOf(Color(0x14000000), Color(0x00000000)),
+            startY = r.top, endY = r.top + band
+        ),
+        topLeft = r.topLeft,
+        size = Size(r.width, band)
+    )
+
+    // 纵向：贴着左边，刻度向右伸；数字横排（转 90° 反而不好读）
+    val y0 = floor((-pan.y / mm) / 5f).toInt() * 5
+    val y1 = ceil((r.height - pan.y) / mm / 5f).toInt() * 5
+    for (i in y0..y1 step 5) {
+        val y = r.top + i * mm + pan.y
+        if (y < r.top - 0.5f || y > r.bottom - 0.5f) continue
+        val long = i % 50 == 0
+        val len = when {
+            long -> major * 2.2f
+            i % 10 == 0 -> major * 1.4f
+            else -> minor
+        }
+        drawLine(
+            color = ink.copy(alpha = if (long) 0.62f else 0.40f),
+            start = Offset(r.left, y),
+            end = Offset(r.left + len, y),
+            strokeWidth = if (long) 1.1.dp.toPx() else 0.8.dp.toPx()
+        )
+        if (long && tm != null && i != 0) {
+            val label = i.toString()
+            val t = tm.measure(
+                label,
+                TextStyle(color = ink.copy(alpha = 0.55f), fontSize = 7.5.sp, fontWeight = FontWeight.Medium)
+            )
+            drawText(t, topLeft = Offset(r.left + len + 2.dp.toPx(), y - t.size.height / 2f))
+        }
+    }
+    drawRect(
+        brush = Brush.horizontalGradient(
+            listOf(Color(0x14000000), Color(0x00000000)),
+            startX = r.left, endX = r.left + band
+        ),
+        topLeft = r.topLeft,
+        size = Size(band, r.height)
+    )
 }
 
 /**
@@ -1319,9 +1558,32 @@ private fun LtSeg(label: String, active: Boolean, onClick: () -> Unit) {
     }
 }
 
+/** 顶栏上的小开关：32dp 高、无重底色，和「+ 添加」并排不抢戏 */
 @Composable
-private fun LtChip(label: String, active: Boolean = false, danger: Boolean = false, onClick: () -> Unit) {
+private fun LtTopChip(label: String, active: Boolean = false, onClick: () -> Unit) {
     Box(
+        Modifier.padding(horizontal = 3.dp).height(44.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .iosTap(pressDim = 0.6f) { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            Modifier.height(32.dp).clip(RoundedCornerShape(10.dp))
+                .background(if (active) Orange.copy(alpha = 0.24f) else Color(0x1FFFFFFF))
+                .padding(horizontal = 11.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                label,
+                color = if (active) Orange else Dv.label1,
+                fontSize = 11.sp, fontWeight = FontWeight.Medium
+            )
+        }
+    }
+}
+
+@Composable
+private fun LtChip(label: String, active: Boolean = false, danger: Boolean = false, onClick: () -> Unit) {    Box(
         Modifier.height(38.dp).clip(RoundedCornerShape(10.dp))
             .background(
                 when {

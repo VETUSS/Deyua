@@ -47,11 +47,26 @@ import kotlin.math.sqrt
  */
 object Layer2 {
 
-    /** 曲线内部可拖控制点数（两端固定，只动中间 5 个）。 */
-    const val CP = 5
+    /**
+     * 曲线控制点上限（含两端）。再多，手机宽度上每个点只剩不到 25 dp 的间距，
+     * 手指一按就是两个 —— 上限本身就是手感的一部分，不是偷懒。
+     */
+    const val CURVE_MAX = 10
 
-    /** 线性曲线：控制点正好落在对角线上。 */
-    val LINEAR: List<Float> = List(CP) { (it + 1).toFloat() / (CP + 1).toFloat() }
+    /**
+     * 线性曲线：只有两端点，(0,0) 与 (1,1)。
+     *
+     * 控制点在这里是**扁平存放的浮点对**：(x0,y0,x1,y1,…)，x 升序，首尾固定 x=0/1。
+     * r43 之前存的是「5 个固定 x 的 y 值」，那套模型的死穴是两端点钉死在 (0,0)/(1,1)：
+     * 拉不出黑场抬升、白场压低，也不能在任意位置加点 —— 想做一个深一点的 S 只能靠
+     * 5 个档位硬凑。现在跟 SpektralLab 的曲线工具对齐（自由加点、拖点、删点、
+     * 端点只上下动），配方仍然是一个浮点数组，旧配方（正好 5 个数）由 [decode]
+     * 一次性迁移成 7 个点，读得进、改得动、存回去就是新格式。
+     */
+    val LINEAR: List<Float> = listOf(0f, 0f, 1f, 1f)
+
+    /** 旧配方里曲线的点数（r43 及以前：5 个固定 x 的 y）。 */
+    private const val LEGACY_CP = 5
 
     /** 单条条带最多多少像素。200 万 ≈ 18 MB（读 + 写各一份 Int）。 */
     private const val STRIP_PX = 2_000_000
@@ -85,7 +100,7 @@ object Layer2 {
         val shHue: Float = 0f, val shSat: Float = 0f, val shLum: Float = 0f,
         val mdHue: Float = 0f, val mdSat: Float = 0f, val mdLum: Float = 0f,
         val hiHue: Float = 0f, val hiSat: Float = 0f, val hiLum: Float = 0f,
-        // ---- 曲线（4 条，每条 5 个控制点的 y 值）----
+        // ---- 曲线（4 条，各是一串自由控制点：(x0,y0,x1,y1,…)）----
         val curveRgb: List<Float> = LINEAR,
         val curveR: List<Float> = LINEAR,
         val curveG: List<Float> = LINEAR,
@@ -105,7 +120,7 @@ object Layer2 {
                 abs(mdHue) < 0.01f && abs(mdSat) < 0.01f && abs(mdLum) < 0.01f &&
                 abs(hiHue) < 0.01f && abs(hiSat) < 0.01f && abs(hiLum) < 0.01f &&
                 abs(vignette) < 0.01f &&
-                curveRgb == LINEAR && curveR == LINEAR && curveG == LINEAR && curveB == LINEAR
+                isLinear(curveRgb) && isLinear(curveR) && isLinear(curveG) && isLinear(curveB)
 
         /** 这一组有没有被改过 —— 面板的节标题靠它点亮小圆点。 */
         fun touched(section: Int): Boolean = when (section) {
@@ -117,7 +132,7 @@ object Layer2 {
                 abs(shHue) + abs(shSat) + abs(shLum) +
                 abs(mdHue) + abs(mdSat) + abs(mdLum) +
                 abs(hiHue) + abs(hiSat) + abs(hiLum) > 0.01f
-            3 -> curveRgb != LINEAR || curveR != LINEAR || curveG != LINEAR || curveB != LINEAR
+            3 -> !isLinear(curveRgb) || !isLinear(curveR) || !isLinear(curveG) || !isLinear(curveB)
             4 -> abs(vignette) > 0.01f
             else -> !isIdentity
         }
@@ -141,10 +156,11 @@ object Layer2 {
             fun fromJson(o: JSONObject?): Cfg {
                 if (o == null) return Cfg()
                 fun f(k: String, d: Float) = o.optDouble(k, d.toDouble()).toFloat()
+                // 曲线一律走 decode：旧配方正好 5 个数 → 迁移成 7 个点；新配方是点对。
+                // 这样一份配方在 r43 与 r44 之间来回存读都不会丢形状。
                 fun curve(k: String): List<Float> {
                     val a = o.optJSONArray(k) ?: return LINEAR
-                    if (a.length() != CP) return LINEAR
-                    return List(CP) { i -> a.optDouble(i, LINEAR[i].toDouble()).toFloat() }
+                    return decode(List(a.length()) { i -> a.optDouble(i, 0.0).toFloat() })
                 }
                 return Cfg(
                     temp = f("temp", 0f), tint = f("tint", 0f),
@@ -165,66 +181,212 @@ object Layer2 {
     // ================================================================ 曲线
 
     /**
-     * 曲线控制点 → 查找表。
+     * 扁平点列表（(x0,y0,x1,y1,…)）→ 规范形式。
      *
-     * [n] 是表长：8 bit 路径用 256（一输入级一项，无需插值），16 bit 路径用 [LUT16]，
-     * 查表时再线性插值 —— 65536 项的表建一次要十几毫秒，拖动时每帧重建不值得。
+     * 三件事：迁移旧配方、夹到单位方格、保证 x 严格升序且首尾在 0 / 1。
+     * 迁移规则很简单 —— 正好 5 个数就是旧格式（5 个固定 x 的 y），
+     * 其余按点对解；解不出来（长度是奇数、点数不足 2）就退回线性。
      *
-     * 用 Fritsch–Carlson 单调三次 Hermite 而不是普通 Catmull-Rom：后者在控制点拉得
-     * 很陡时会**过冲**，出一条反相的亮边（暗部被压到负、高光冲到 1 以上再裁掉），
-     * 看起来像脏点。单调插值保证曲线永远不往回走，这是图像曲线编辑器的硬要求。
-     *
-     * 另外这里会顺序修复非单调输入：用户把第 3 个点拖到第 2 个点下面时，
-     * 不会得到一条打结的曲线，而是自动把它顶平 —— 与 Lightroom 的行为一致。
+     * 这个函数是**唯一**的入口：Cfg 反序列化、编辑器加点、读旧配方都走它，
+     * 所以"什么算一条合法曲线"只有一份定义。
      */
-    fun curveLut(ys: List<Float>, samples: Int = 256): FloatArray {
-        val n = CP + 2
-        val xs = DoubleArray(n)
-        val yy = DoubleArray(n)
-        xs[0] = 0.0; yy[0] = 0.0
-        for (i in 0 until CP) {
-            xs[i + 1] = (i + 1).toDouble() / (CP + 1).toDouble()
-            yy[i + 1] = ys.getOrElse(i) { LINEAR[i] }.toDouble().coerceIn(0.0, 1.0)
-        }
-        xs[n - 1] = 1.0; yy[n - 1] = 1.0
-        for (i in 1 until n) if (yy[i] < yy[i - 1]) yy[i] = yy[i - 1]
-
-        val d = DoubleArray(n - 1)
-        for (i in 0 until n - 1) d[i] = (yy[i + 1] - yy[i]) / (xs[i + 1] - xs[i])
-        val m = DoubleArray(n)
-        m[0] = d[0]; m[n - 1] = d[n - 2]
-        for (i in 1 until n - 1) m[i] = (d[i - 1] + d[i]) / 2.0
-        for (i in 0 until n - 1) {
-            if (abs(d[i]) < 1e-9) {
-                m[i] = 0.0; m[i + 1] = 0.0
-            } else {
-                val a = m[i] / d[i]
-                val b = m[i + 1] / d[i]
-                val s = a * a + b * b
-                if (s > 9.0) {
-                    val t = 3.0 / sqrt(s)
-                    m[i] = t * a * d[i]
-                    m[i + 1] = t * b * d[i]
+    fun decode(raw: List<Float>?): List<Float> {
+        if (raw == null) return LINEAR
+        var pts: List<Float> = when {
+            raw.size == LEGACY_CP -> {
+                // r43 及以前：x 固定在 i/6，首尾 (0,0)/(1,1) 是隐含的
+                val out = ArrayList<Float>(14)
+                out.add(0f); out.add(0f)
+                for (i in 0 until LEGACY_CP) {
+                    out.add((i + 1).toFloat() / (LEGACY_CP + 1))
+                    out.add(raw[i].coerceIn(0f, 1f))
                 }
+                out.add(1f); out.add(1f)
+                out
+            }
+            raw.size < 4 || raw.size % 2 != 0 -> return LINEAR
+            else -> raw
+        }
+        // 夹取 + 按 x 排序（配方可能被手改过，不能假设有序）
+        val n = pts.size / 2
+        val idx = (0 until n).sortedBy { pts[it * 2] }
+        val out = ArrayList<Float>(pts.size)
+        var last = -1f
+        for (k in idx) {
+            val x = pts[k * 2].coerceIn(0f, 1f)
+            val y = pts[k * 2 + 1].coerceIn(0f, 1f)
+            if (x <= last + 1e-3f) continue          // 两个点叠在一起：留前一个
+            out.add(x); out.add(y)
+            last = x
+        }
+        if (out.size < 4) return LINEAR
+        // 首尾的 x 由定义决定，y 留给用户（这就是黑场 / 白场）
+        out[0] = 0f
+        out[out.size - 2] = 1f
+        return out
+    }
+
+    /** 这条曲线是不是"没动过"：每个点都落在对角线上（1/255 以内）。 */
+    fun isLinear(points: List<Float>): Boolean {
+        if (points.size < 4) return true
+        var i = 0
+        while (i + 1 < points.size) {
+            if (abs(points[i + 1] - points[i]) > 0.004f) return false
+            i += 2
+        }
+        return true
+    }
+
+    /** 要几个点才能描述这条曲线（供 UI 显示）。 */
+    fun pointCount(points: List<Float>): Int = points.size / 2
+
+    /**
+     * 曲线在 x 处的值。用 Fritsch–Carlson 单调三次 Hermite 求切线，再取一段
+     * Hermite 基函数 —— 和 [curveLut] 同一套数学，只是单点求值。
+     *
+     * 编辑器画曲线、读数都用它：曲线是**看着调的**，画的形状和真正作用在像素上的
+     * 形状必须同源，否则调完和导出对不上。
+     */
+    fun evaluate(points: List<Float>, x: Float): Float {
+        val n = points.size / 2
+        if (n < 2) return x.coerceIn(0f, 1f)
+        val px = FloatArray(n) { points[it * 2] }
+        val py = FloatArray(n) { points[it * 2 + 1] }
+        val xx = x.coerceIn(0f, 1f)
+        if (xx <= px[0]) return py[0]
+        if (xx >= px[n - 1]) return py[n - 1]
+        val m = tangents(px, py)
+        var k = 0
+        while (k < n - 2 && xx > px[k + 1]) k++
+        val h = (px[k + 1] - px[k]).coerceAtLeast(1e-6f)
+        val t = ((xx - px[k]) / h).coerceIn(0f, 1f)
+        val t2 = t * t
+        val t3 = t2 * t
+        val v = (2 * t3 - 3 * t2 + 1) * py[k] +
+            (t3 - 2 * t2 + t) * h * m[k] +
+            (-2 * t3 + 3 * t2) * py[k + 1] +
+            (t3 - t2) * h * m[k + 1]
+        return v.coerceIn(0f, 1f)
+    }
+
+    /**
+     * Fritsch–Carlson 切线。相邻两段斜率异号时切线取 0 —— 这正是"曲线折返也不会
+     * 打结"的来源：折点处变成一条平的切线，曲线从上面滑过去，不会甩出一个过冲。
+     * 每段的切线再被限制在同段斜率的 3 倍以内（那个 s>9 的判断），保证不过冲。
+     */
+    private fun tangents(px: FloatArray, py: FloatArray): FloatArray {
+        val n = px.size
+        val d = FloatArray(n - 1)
+        for (i in 0 until n - 1) d[i] = (py[i + 1] - py[i]) / (px[i + 1] - px[i]).coerceAtLeast(1e-6f)
+        val m = FloatArray(n)
+        m[0] = d[0]; m[n - 1] = d[n - 2]
+        for (i in 1 until n - 1) m[i] = if (d[i - 1] * d[i] <= 0f) 0f else (d[i - 1] + d[i]) / 2f
+        for (i in 0 until n - 1) {
+            if (abs(d[i]) < 1e-9f) { m[i] = 0f; m[i + 1] = 0f; continue }
+            val a = m[i] / d[i]
+            val b = m[i + 1] / d[i]
+            val s = a * a + b * b
+            if (s > 9f) {
+                val t = 3f / sqrt(s)
+                m[i] = t * a * d[i]
+                m[i + 1] = t * b * d[i]
             }
         }
+        return m
+    }
 
+    /**
+     * 曲线控制点 → 查找表。
+     *
+     * [samples] 是表长：8 bit 路径用 256（一输入级一项，无需插值），16 bit 路径用 [LUT16]，
+     * 查表时再线性插值 —— 65536 项的表建一次要十几毫秒，拖动时每帧重建不值得。
+     */
+    fun curveLut(points: List<Float>, samples: Int = 256): FloatArray {
         val lut = FloatArray(samples)
+        val n = points.size / 2
+        if (n < 2) {
+            for (i in 0 until samples) lut[i] = i / (samples - 1f)
+            return lut
+        }
+        val px = FloatArray(n) { points[it * 2] }
+        val py = FloatArray(n) { points[it * 2 + 1] }
+        val m = tangents(px, py)
         var k = 0
         for (i in 0 until samples) {
-            val x = i / (samples - 1.0)
-            while (k < n - 2 && x > xs[k + 1]) k++
-            val hseg = xs[k + 1] - xs[k]
-            val t = ((x - xs[k]) / hseg).coerceIn(0.0, 1.0)
+            val x = i / (samples - 1f)
+            while (k < n - 2 && x > px[k + 1]) k++
+            val h = (px[k + 1] - px[k]).coerceAtLeast(1e-6f)
+            val t = ((x - px[k]) / h).coerceIn(0f, 1f)
             val t2 = t * t
             val t3 = t2 * t
-            val v = (2 * t3 - 3 * t2 + 1) * yy[k] +
-                (t3 - 2 * t2 + t) * hseg * m[k] +
-                (-2 * t3 + 3 * t2) * yy[k + 1] +
-                (t3 - t2) * hseg * m[k + 1]
-            lut[i] = v.toFloat().coerceIn(0f, 1f)
+            val v = (2 * t3 - 3 * t2 + 1) * py[k] +
+                (t3 - 2 * t2 + t) * h * m[k] +
+                (-2 * t3 + 3 * t2) * py[k + 1] +
+                (t3 - t2) * h * m[k + 1]
+            lut[i] = v.coerceIn(0f, 1f)
         }
         return lut
+    }
+
+    // ---------------------------------------------------------------- 编辑操作
+    //
+    // 三个操作都返回**新列表**（Compose 靠引用变化重组），并且都自己保证
+    // "x 严格升序、点数不超上限、两端点留在原地"。
+
+    /**
+     * 拖第 [i] 个点。两端点只能上下动（那是黑场 / 白场），中间点可以在
+     * 左右邻居之间自由移动 —— x 不能越过邻居，否则曲线会自己打结。
+     */
+    fun movePoint(points: List<Float>, i: Int, x: Float, y: Float): List<Float> {
+        val n = points.size / 2
+        if (i < 0 || i >= n) return points
+        val out = points.toMutableList()
+        val cx = when {
+            i == 0 -> 0f
+            i == n - 1 -> 1f
+            else -> {
+                // 邻居可能已经贴得比 0.024 还近（手改过的配方、或两次拖动叠在一起）：
+                // 这时 coerceIn 的区间是反的，会直接抛异常 —— 宁可原地不动。
+                val lo = points[(i - 1) * 2] + 0.012f
+                val hi = points[(i + 1) * 2] - 0.012f
+                if (lo >= hi) points[i * 2] else x.coerceIn(lo, hi)
+            }
+        }
+        out[i * 2] = cx
+        out[i * 2 + 1] = y.coerceIn(0f, 1f)
+        return out
+    }
+
+    /**
+     * 在 (x,y) 插一个点，返回 (新列表, 新点的序号)。点数到顶时返回 null ——
+     * 静默不动比"挤掉一个你看不见的点"好。
+     */
+    fun insertPoint(points: List<Float>, x: Float, y: Float): Pair<List<Float>, Int>? {
+        if (points.size / 2 >= CURVE_MAX) return null
+        val cx = x.coerceIn(0.004f, 0.996f)
+        val cy = y.coerceIn(0f, 1f)
+        // 太靠近现有点就不加，直接返回那个点（手指想抓它，只是没按准）
+        var k = 0
+        while (k * 2 < points.size) {
+            if (abs(points[k * 2] - cx) < 0.012f) return points to k
+            k++
+        }
+        var at = 0
+        while (at * 2 < points.size && points[at * 2] < cx) at++
+        val out = points.toMutableList()
+        out.add(at * 2, cy)
+        out.add(at * 2, cx)
+        return out to at
+    }
+
+    /** 删中间的第 [i] 个点；两端点删不得（它们是曲线的定义域），返回 null 表示没删。 */
+    fun removePoint(points: List<Float>, i: Int): List<Float>? {
+        val n = points.size / 2
+        if (i <= 0 || i >= n - 1) return null
+        val out = points.toMutableList()
+        out.removeAt(i * 2 + 1)
+        out.removeAt(i * 2)
+        return out
     }
 
     // ================================================================ 主入口

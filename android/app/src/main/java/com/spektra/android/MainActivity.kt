@@ -1,9 +1,11 @@
 package com.spektra.android
 
+import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
@@ -16,6 +18,7 @@ import android.provider.OpenableColumns
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -41,6 +44,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -203,6 +207,9 @@ private val RASTER_EXTS = listOf("jpg", "jpeg", "png", "heic", "heif", "tif", "t
 
 class MainActivity : ComponentActivity() {
     private val pendingImport = mutableStateOf<Uri?>(null)
+    // [r48] 从系统分享面板进来的图。先落在缓存里，等引擎就绪再交给导入流程 ——
+    // 冷启动时分享过来的图比引擎初始化快，直接塞进 pendingImport 会撞上"引擎未就绪"。
+    private val pendingShare = mutableStateOf<Uri?>(null)
     private val picker = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         pendingImport.value = uri
     }
@@ -229,20 +236,108 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 整个进程统一走 edge-to-edge：内容铺到系统栏下面，谁需要让位谁自己按 insets 让
+        // （主界面是 Scaffold 的 contentWindowInsets，观片台是自己 systemBarsPadding）。
+        //
+        // r47 之前这里不设，全靠系统默认的 fit 模式，而观片台为了铺满整屏会临时切到
+        // edge-to-edge、退出时再切回来。问题就出在这次"切回来"：窗口模式变了，但
+        // 已经派发下去的 insets 不会立刻重算，Scaffold 于是又按状态栏高度让了一次位 ——
+        // 顶栏就从原来的位置往下掉了一截，要等下次转屏或重启才恢复。
+        // 现在窗口模式从启动到退出都不再变，观片台只显隐系统栏，不可能再牵连顶栏。
+        androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+        // 挖孔模式也一次定死：默认的 DEFAULT 会让竖屏顶部整条为前摄让位（状态栏收起来
+        // 了那条黑还在），观片台铺满整屏时就露馅。这个属性同样不能在进出观片台时来回切。
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode =
+                    android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
         Diagnostics.init(applicationContext) // 持久化诊断日志：崩溃后保留上次会话日志
         setContent {
             SpektraScreen(
                 onPickPhoto = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
                 onPickFile = { filePicker.launch(arrayOf("*/*")) },
                 pendingImport = pendingImport,
+                pendingShare = pendingShare,
             )
         }
+        // 只在"真正新开"时处理分享：转屏/进程恢复时 onCreate 会再跑一遍，
+        // 同一个 Intent 会再把那张图导一次。
+        if (savedInstanceState == null) handleSharedIntent(intent)
+    }
+
+    /**
+     * [r48] 系统分享面板把图交给我们（ACTION_SEND / SEND_MULTIPLE）。
+     *
+     * 两条硬性处理：
+     *  1. **立刻复制到自己的缓存**。分享进来的 `content://` 只是对方临时授给我们的读
+     *     权限，绑定在"这一份 Intent 的接收方"上；而这张图之后还要被 RAW 解码、读
+     *     EXIF、导出时再读一遍。复制一份之后整条链路只认自己的文件，不会有"刚导入
+     *     好好的，导出时说没权限"。
+     *  2. 复制放在后台线程，完成后才置 pendingShare —— 大图 copy 几百毫秒，不能卡主线程。
+     */
+    private fun handleSharedIntent(intent: Intent?) {
+        val action = intent?.action ?: return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+        // 不要按 action 去猜 EXTRA_STREAM 的静态类型：SEND 里塞 ArrayList、SEND_MULTIPLE
+        // 里塞单个 Uri 的 app 都真实存在。拿 Any? 再判，谁都不会崩。
+        val raw = intent.extras?.get(Intent.EXTRA_STREAM)
+        val list: List<Uri> = when (raw) {
+            is Uri -> listOf(raw)
+            is ArrayList<*> -> raw.filterIsInstance<Uri>()
+            else -> emptyList()
+        }
+        val uri = list.firstOrNull() ?: return
+        // 多张只取第一张：编辑器一次只处理一张，剩下几张留在原相册里，比"悄悄只导了
+        // 一张、也不说一声"清楚。
+        val extra = (list.size - 1).coerceAtLeast(0)
+        Thread {
+            val copy = runCatching { copySharedToCache(uri) }.getOrNull()
+            runOnUiThread {
+                if (copy != null) {
+                    pendingShare.value = copy
+                    if (extra > 0) android.widget.Toast.makeText(
+                        this, "已接收 ${extra + 1} 张，先打开第一张", android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    android.widget.Toast.makeText(
+                        this, "读不到分享的图片", android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }.start()
+    }
+
+    /** 把分享进来的 Uri 复制进 cache/share，返回自己的 file:// Uri（失败返回 null）。 */
+    private fun copySharedToCache(uri: Uri): Uri? {
+        val name = runCatching { rawDisplayName(this, uri) }.getOrDefault("")
+        val ext = name.substringAfterLast('.', "").lowercase()
+            .takeIf { it.length in 2..5 && it.all { c -> c.isLetterOrDigit() } } ?: "jpg"
+        val dir = java.io.File(cacheDir, "share").apply { mkdirs() }
+        val out = java.io.File(dir, "shared_${System.currentTimeMillis()}.$ext")
+        contentResolver.openInputStream(uri)?.use { ins ->
+            out.outputStream().use { ins.copyTo(it, 1 shl 16) }
+        } ?: return null
+        return if (out.length() > 0L) Uri.fromFile(out) else null
+    }
+
+    /** 已经在前台时再分享一次：singleTask 不会重建实例，图从这里进来。 */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleSharedIntent(intent)
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport: MutableState<Uri?>) {
+fun SpektraScreen(
+    onPickPhoto: () -> Unit,
+    onPickFile: () -> Unit,
+    pendingImport: MutableState<Uri?>,
+    pendingShare: MutableState<Uri?> = mutableStateOf(null),
+) {
     val ctx = LocalContext.current
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     var engine by remember { mutableStateOf<SpektraEngine?>(null) }
@@ -280,11 +375,24 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
     var overscanGate by remember { mutableStateOf("auto") }
     var overscanHoles by remember { mutableStateOf("white") }
     var overscanCarrier by remember { mutableStateOf("none") }
+    // [r43] 半格组：两格 18×24 拼成一条 37×24 交给引擎的 overscan_pair
+    var pairActive by remember { mutableStateOf(false) }
+    // [r43] 数字中间片：跳过相纸，出平淡中性的底片扫描
+    var diActive by remember { mutableStateOf(false) }
+    // 叠片前的原片：撤销时重新导入它
+    var compositeFrom by remember { mutableStateOf<Uri?>(null) }
+    var compositeBusy by remember { mutableStateOf(false) }
     // 片边上是否印字（胶片厂商的边码）。留个开关：
     // ① 有人就喜欢只有边、没有字；② 排查时可一键回到"完全不印字"的行为对照。
     var overscanEdgeText by remember { mutableStateOf(true) }
     var overscanCameraSeed by remember { mutableIntStateOf(1) }
     var overscanFrameSeed by remember { mutableIntStateOf(1) }
+    // 取景：裁剪窗的中心（归一化到源图）与放大倍数。zoom = 1 就是"能放下的最大门幅窗"，
+    // 也就是以前那个居中裁切；放大只能往里收，所以永远不会裁到源图外面。
+    var osCropCx by remember { mutableFloatStateOf(0.5f) }
+    var osCropCy by remember { mutableFloatStateOf(0.5f) }
+    var osZoom by remember { mutableFloatStateOf(1f) }
+    var showOsFrame by remember { mutableStateOf(false) }
     // 日期后背（RFC-031）：相机在底片上烧的日期/拍摄数据。与片边同属"拍摄层"
     // （SHOOT，非 live），改一次就要重冲一次负片。
     var dateBack by remember { mutableStateOf(DateBackCfg()) }
@@ -304,6 +412,10 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
     // 再跑一遍 Layer 2（十几毫秒），这才是实时。
     var previewBase by remember { mutableStateOf<Bitmap?>(null) }
     var preview by remember { mutableStateOf<Bitmap?>(null) }
+    // [r43.1] 最近一次冲洗失败的原因。以前渲染返回 null 时界面只有一个转不完的圈：
+    // "数字中间片"在 Android 上缺一个着色器，引擎整帧返回 null，用户看到的就是
+    // 「一直显示冲洗中」。失败必须说出来，而且要说清是哪一步，否则只能靠猜。
+    var renderFail by remember { mutableStateOf<String?>(null) }
     // [r37] 与 previewBase 配套的 16 bit 原帧。调色走 Layer2.apply16 —— 先降到 8 bit
     // 再拉曲线，斜率大于 1 的段落会空出色阶，就是"幅度稍大就断层"。渲染失败的帧这里是 null，
     // 调色会自动退回 8 bit 路径（画面正确，只是断层会回来）。
@@ -334,6 +446,11 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
     var tab by remember { mutableIntStateOf(0) }
     var showLog by remember { mutableStateOf(false) }
     var showGallery by remember { mutableStateOf(false) }
+    // [r50] 已导出胶片：底部状态栏的片条按钮打开；live 页叠在它上面（同一个窗口，返回逐级）
+    var showExports by remember { mutableStateOf(false) }
+    var livePair by remember { mutableStateOf<Pair<ExportRecord, Int>?>(null) }
+    var exportsTick by remember { mutableIntStateOf(0) }
+    var exportsCount by remember { mutableIntStateOf(0) }
     // 观片台：从相册进入时把列表带过来，退出后回到相册
     var lightTablePhotos by remember { mutableStateOf<List<GalleryPhoto>?>(null) }
     // [r30] 「关于」现在是独立面板：构建校验状态 + 两份许可证全文 + 源码入口
@@ -459,8 +576,18 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
         return "\"input_color_space\":\"$inCs\",\"input_cctf_decoding\":${!photoIsRaw}," +
                "\"output_color_space\":\"sRGB\",\"film_format_mm\":${FORMAT_MM[formatIdx]},"
     }
-    fun buildDelta(): String = buildString {
+    fun buildDelta(inputRawOverride: Boolean? = null): String = buildString {
         append("{\"film_stock\":\"${filmVariant}\",\"print_stock\":\"${printVariant}\",")
+        // 数字中间片：引擎在 pipeline 里把印相换成"扫描底片"，出的是密度不是相纸反差。
+        // 只对彩色负片有意义（引擎自己对反转片/黑白会忽略），所以照实下发即可。
+        //
+        // [r49.1] **必须每帧显式下发 true / false**。引擎的 apply_delta() 只写 delta
+        // 里出现过的键（params.cpp `for (const auto& kv : delta.fields())`），没出现的
+        // 保持原值。原来只在打开时写 true，于是关掉开关只是宿主不再套 DI 视图，
+        // 引擎那边 digital_intermediate 仍是 true —— 它继续吐 Cineon 码值（参考白
+        // 685/1023 ≈ 171/255），Kotlin 却把码值直接当画面显示：整张图又灰又淡、
+        // 饱和度和反差一起塌掉。这和 r11.1 的 overscan、日期后背是同一个坑。
+        append("\"digital_intermediate\":${diActive && !scanFilm},")
         append("\"exposure_compensation_ev\":${exposureEv},")
         // —— 相机侧（r11 第 1 批）——
         // camera_filter 为空 = 不装滤色片（引擎认 ""）。它会重塑"照片由什么光组成"，
@@ -474,8 +601,9 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
         // 色彩空间匹配：栅格照片是 sRGB 编码值(byte/255f)，引擎 input_cctf_decoding 需开，先线性化再配光，
         // 否则把编码值当线性会整体偏暗；RAW 解码输出已是线性 ProPhoto，input_cctf_decoding 保持 false。
         // input 对齐来源，output 固定 sRGB(预览 bitmap 默认 sRGB)。
-        val inCs = if (photoIsRaw) "ProPhoto RGB" else "sRGB"
-        append("\"input_color_space\":\"$inCs\",\"input_cctf_decoding\":${!photoIsRaw},")
+        val inRaw = inputRawOverride ?: photoIsRaw
+        val inCs = if (inRaw) "ProPhoto RGB" else "sRGB"
+        append("\"input_color_space\":\"$inCs\",\"input_cctf_decoding\":${!inRaw},")
         append("\"output_color_space\":\"sRGB\",")
         // 光晕完全对齐开源原版：halation_active 默认 true、boost_ev 默认 0，
         // per-stock 强度由引擎 apply_halation_preset 按 profile 的 antihalation(strong/weak) 自动设置
@@ -485,7 +613,12 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
         // 去碳层胶片(CineStill: antihalation=no → back_reflection=true)会触发引擎未移植到
         // Android 的 spk_highlight_headroom kernel。headroom_ev=0 使其跳过该节点，
         // 去碳层红光晕散射其余部分不受影响。
-        if (filmVariant.startsWith("cinestill_")) append("\"halation_headroom_ev\":0.0,")
+        //
+        // [r49.1] 同样必须**每帧显式下发**：以前只在 cinestill 上写 0，换到别的胶片时
+        // 键消失了，引擎就保留着 0（默认是 4.0 EV，params.hpp:105）。目前只有去碳层
+        // 底片会走到那个节点、而它们本来就该是 0，所以这是潜伏问题不是当前的 bug ——
+        // 但同一类坑已经咬过三次（overscan / 日期 / DI），一并堵掉。
+        append("\"halation_headroom_ev\":${if (filmVariant.startsWith("cinestill_")) 0.0 else 4.0},")
         val grainOn = grainAmount > 0f
         append("\"grain_active\":$grainOn,\"grain_amount\":$grainAmount,\"grain_sublayers_active\":$grainOn")
         // —— 胶片细节强度（r11 第 1 批）——
@@ -516,7 +649,10 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
         // 片边（引擎真实 overscan）：开启时把格式/模式/seed/雾/漏光/片门/齿孔/载体交给引擎
         // forceNoOverscan 只由分级自救写入：卡死重试时临时按"无片边"下发，不改用户的开关状态。
         if (overscanActive && !forceNoOverscan) {
-            append(",\"overscan_active\":true,\"overscan_format\":\"$overscanFormat\",\"overscan_mode\":\"$overscanMode\",")
+            val osFormat = if (pairActive) "135_half" else overscanFormat
+            append(",\"overscan_active\":true,\"overscan_format\":\"$osFormat\",\"overscan_mode\":\"$overscanMode\",")
+            // 半格组：输入已经是两格（左 18 + 1 mm + 右 18），引擎按 pair 切两扇门
+            if (pairActive) append("\"overscan_pair\":true,")
             append("\"overscan_camera_seed\":$overscanCameraSeed,\"overscan_frame_seed\":$overscanFrameSeed,")
             append("\"overscan_fog\":$overscanFog,\"overscan_leaks\":$overscanLeaks,")
             append("\"overscan_gate\":\"$overscanGate\",\"overscan_holes\":\"$overscanHoles\",\"overscan_carrier\":\"$overscanCarrier\",")
@@ -544,19 +680,20 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
             // geometry_crop 是粘性的：delta 不传会残留上一次的裁切，故每次都显式写全图或门幅裁切。
             var cw = 1.0; var ch = 1.0
             val w = sourceW.toDouble(); val h = sourceH.toDouble()
+            // 裁剪窗的左上角（engine 的 geometry_crop_x/y 是左上角，不是中心）
+            var cx = 0.0; var cy = 0.0
             if (w > 0 && h > 0) {
-                val gate = osGateRatio(overscanFormat)
-                val cur = maxOf(w, h) / minOf(w, h)
-                if (kotlin.math.abs(cur / gate - 1.0) > 0.05) {
-                    val (nw, nh) = if (cur > gate) {
-                        val tl = minOf(w, h) * gate
-                        if (w >= h) Pair(tl / w, 1.0) else Pair(1.0, tl / h)
-                    } else {
-                        val ts = maxOf(w, h) / gate
-                        if (w >= h) Pair(1.0, ts / h) else Pair(ts / w, 1.0)
-                    }
-                    if (nw in 0.05..1.0 && nh in 0.05..1.0) { cw = nw; ch = nh }
-                }
+                // 底窗：该门幅在源图里能放下的最大窗口（以前只有这一个，永远居中）
+                // 半格组要把整条 37×24 都当成"门"，否则引擎只看到一格
+                val (bw, bh) = osBaseCrop(w, h, if (pairActive) "135_half_pair" else overscanFormat)
+                // 取景页定的放大与位置。窗按倍率收，中心夹在放得下的范围里
+                val z = osZoom.toDouble().coerceIn(1.0, 8.0)
+                cw = (bw / z).coerceIn(0.05, 1.0)
+                ch = (bh / z).coerceIn(0.05, 1.0)
+                val ccx = osCropCx.toDouble().coerceIn(cw / 2.0, 1.0 - cw / 2.0)
+                val ccy = osCropCy.toDouble().coerceIn(ch / 2.0, 1.0 - ch / 2.0)
+                cx = ccx - cw / 2.0
+                cy = ccy - ch / 2.0
             }
             // [DEYVA-FIX v0.8.93] 片门画面破损的**根因**就在这里。
             // 引擎的 geometry_crop_x/y 是裁剪窗的**左上角**（nodes.metal /
@@ -569,8 +706,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
             // 下方「最后一行」拉成的竖条 + 右下角纯色。
             // 居中裁剪的左上角就是 (1 - crop_w)/2、(1 - crop_h)/2；
             // crop_w/h == 1 时它恰好是 0，geometry 走 identity 分支（连节点都不跑）。
-            val cx = (1.0 - cw) / 2.0
-            val cy = (1.0 - ch) / 2.0
+            // 取景页介入后，这个角由用户定的中心推出来（见上），不再固定居中。
             // [r40.1] 下发到引擎的裁剪必须能一眼看到：片边是全尺寸导出里唯一一处
             // 会改变"帧"尺寸的地方，而帧尺寸又决定画布（长边 = 帧宽 + 两边留白）。
             // 以前这行只走 android Log.i，诊断日志里看不到，出问题只能猜。
@@ -678,6 +814,15 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
         return d
     }
 
+    // 解码曲线（场景侧，胶片之前）与"本张已经应用过的那一份"。
+    // [r49.3] 声明放在这里（而不是 UI 附近的 1500 行）是有原因的：recipeSnapshot() /
+    // applyRecipe() 是局部函数，只能引用在它们**之前**声明的局部变量，而解码曲线现在是
+    // 配方的一部分（见下）。
+    var sceneCurve by remember { mutableStateOf(SceneCurve.Cfg()) }
+    var sceneApplied by remember { mutableStateOf(SceneCurve.Cfg()) }
+    // 重算计数：滑杆松手 / 应用配方 / 重置 都会 +1，由下面的 effect 用原片重跑一遍。
+    var sceneTick by remember { mutableIntStateOf(0) }
+
     // ===== 配方快照（r11 第 0 批）=====
     // 存**完整**快照，不是差异。引擎 apply_delta 只写「出现过」的键，若只存用户
     // 改过的字段，应用配方时上一套的片边 / 日期会残留下来 —— r1 那个「片边关不掉、
@@ -724,11 +869,20 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
         o.put("dateInsetX", dateInsetX.toDouble()); o.put("dateInsetY", dateInsetY.toDouble())
         // 输出模式
         o.put("scanFilm", scanFilm)
+        // [r49] 数字中间片也是配方的一部分。以前只存 scanFilm，含 DI 的配方存下来
+        // 再套回去就变成「正常印相」——同一份配方两次出片完全不同，和 r19 那个
+        // trueColor 的坑一模一样。
+        o.put("diActive", diActive)
         // [r19] 色彩模式也要进配方：否则存的时候是「原色」，应用回来变成「校色」，
         // 同一份配方两次出片颜色不一样（这就是"配方不完整"的那类隐蔽 bug）。
         o.put("trueColor", filmTrueColor)
         // [r33] 调色当然是配方的一部分：曲线、色温、暗角都在这里
         o.put("tone", tone.toJson())
+        // [r49.3] 解码曲线也是配方的一部分。和 r49 的 diActive 同一个坑：只存
+        // 「看得见的调色」不存「场景侧的塑形」，同一份配方套回去出片就不一样了。
+        o.put("sceneEv", sceneCurve.ev.toDouble())
+        o.put("sceneShadow", sceneCurve.shadow.toDouble())
+        o.put("sceneHighlight", sceneCurve.highlight.toDouble())
         return o.toString()
     }
 
@@ -793,15 +947,29 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
         dateInsetX = o.optDouble("dateInsetX", dateInsetX.toDouble()).toFloat()
         dateInsetY = o.optDouble("dateInsetY", dateInsetY.toDouble()).toFloat()
         scanFilm = o.optBoolean("scanFilm", scanFilm)
+        // 两条互斥：配方本身可能来自更老的版本（没有 diActive），此刻若 scanFilm 为真，
+        // DI 必须让位，否则 UI 上会同时"亮"着两个开关。
+        diActive = o.optBoolean("diActive", diActive) && !scanFilm
         filmTrueColor = o.optBoolean("trueColor", filmTrueColor)
         // 旧配方没有这个键：fromJson(null) 给出默认值，也就是"不带调色"。
         // 这里刻意覆盖而不是保留当前值 —— 配方是一份完整快照，应用它就该回到那个状态。
         tone = Layer2.Cfg.fromJson(o.optJSONObject("tone"))
+        // [r49.3] 解码曲线：旧配方没有这三个键 → 全部取 0（= 与原片一致），
+        // 这正好是"没有这条曲线"的语义，不会把当前曲线强加给旧配方。
+        val sc = SceneCurve.Cfg(
+            ev = o.optDouble("sceneEv", 0.0).toFloat(),
+            shadow = o.optDouble("sceneShadow", 0.0).toFloat(),
+            highlight = o.optDouble("sceneHighlight", 0.0).toFloat(),
+        )
+        val sceneChanged = sc != sceneCurve
+        sceneCurve = sc
 
         // 新配方不继承"分级自救"留下的临时省略状态
         forceNoOverscan = false; forceNoEdgeText = false
         renderTick++
         thumbReq++
+        // 场景侧变了必须重算一次（它是送进胶片之前的像素，不是渲染参数）
+        if (sceneChanged) sceneTick++
         return true
     }
 
@@ -828,6 +996,11 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
         overscanEdgeText = true; overscanFNumber = 0f; overscanFrameNumber = 0
         dateBack = DateBackCfg(); dateInsetX = 3f; dateInsetY = 2.4f
         scanFilm = false; filmTrueColor = false
+        diActive = false
+        // [r49.3] 解码曲线也要复位：它是"场景侧"的塑形，留在原地就不是出厂状态了
+        val sceneWas = !sceneCurve.isIdentity
+        sceneCurve = SceneCurve.Cfg()
+        if (sceneWas) sceneTick++
         // [r33] 调色也一起复位 —— 「重置」是"回到出厂"，留着一套曲线和暗角在画面里，
         // 用户会以为重置坏了（r30 那次已经踩过一次同类问题）。
         tone = Layer2.Cfg()
@@ -866,7 +1039,40 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                     try {
                         var st = System.currentTimeMillis()
                         stage.set("setParams")
-                        eng.setParams(sess, delta)
+                        // set_params 在 JNI 里是"失败就抛 RuntimeException"。以前这一句
+                        // 没有 try：异常被最外层 catch 吞掉，这一帧直接不出图，界面停在
+                        // 上一张 —— 数字中间片被引擎拒绝时，用户看到的就是"预览定格"。
+                        // 现在把引擎原话留下来（会显示在预览上方的红条里）。
+                        try {
+                            val echo = eng.setParams(sess, delta)
+                            // [r49.1] 回读校验（只记日志，不动行为）。
+                            //
+                            // 引擎的 apply_delta 只写 delta 里**出现过**的键，漏发一个
+                            // 布尔，它就会安静地停在上一帧的状态上：overscan 关不掉、
+                            // 日期去不掉、数字中间片关掉后画面一直灰 —— 三次都是这个
+                            // 机制。这里拿 set_params 回显的整份 params 对一次账，只报
+                            // 那几个"必须每帧显式下发"的开关，不一致就留一行日志。
+                            runCatching {
+                                val p = org.json.JSONObject(echo).optJSONObject("params")
+                                    ?: return@runCatching
+                                val want = listOf(
+                                    "digital_intermediate" to (diActive && !scanFilm),
+                                    "scan_film" to scanFilm,
+                                    "overscan_active" to (overscanActive && !forceNoOverscan),
+                                    "date_imprint_active" to dateBack.active,
+                                )
+                                val bad = want.filter { (k, v) -> p.has(k) && p.optBoolean(k) != v }
+                                if (bad.isNotEmpty()) Diagnostics.log("render",
+                                    "参数回读不一致（引擎≠宿主）：" + bad.joinToString(" ") {
+                                        "${it.first}=${p.optBoolean(it.first)}≠${it.second}"
+                                    })
+                            }
+                        } catch (e: Exception) {
+                            renderFail = "参数被引擎拒绝：${e.message?.take(160)}"
+                            mainHandler.post { status = renderFail }
+                            Diagnostics.log("render", "setParams 失败: ${e.message}")
+                            throw e
+                        }
                         Diagnostics.log("render", "  setParams ${System.currentTimeMillis() - st}ms")
                         st = System.currentTimeMillis()
                         stage.set("solve")
@@ -888,7 +1094,11 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                         // 首次渲染没有负片缓存会失败，此时自动回退到完整渲染，行为不变。
                         var frame: Frame16? = null
                         val prevDelta = lastRenderedDelta.get()
-                        if (prevDelta != null && onlyPrintLayerChanged(prevDelta, delta)) {
+                        // 数字中间片不走 reprint：它的"印相"换成了底片扫描，输出本来就
+                        // 与相纸无关。走缓存重印会让相纸选择看着像"没反应"，也可能
+                        // 复用到没有 DI 常数的旧管线 —— 宁可多花一次完整渲染。
+                        val diOn = delta.contains("\"digital_intermediate\":true")
+                        if (!diOn && prevDelta != null && onlyPrintLayerChanged(prevDelta, delta)) {
                             stage.set("reprint")
                             val tRp = System.currentTimeMillis()
                             frame = eng.reprintFrame(sess, "live")
@@ -903,13 +1113,36 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                             frame = eng.renderFrame(sess, "live")
                         }
                         val tb = System.currentTimeMillis()
-                        val b = frame?.toBitmap()
+                        // [r49] 数字中间片吐出来的是 Cineon 码值，不是画面。先过 DI 视图
+                        // （解码 → 亮度 shoulder → path to white → sRGB），与 macOS 画布
+                        // 同一套常数（DiView / CineonLUT.swift）。不过这一层的话，白点只到
+                        // 171/255、中灰 117/255 —— 那就是"开 DI 以后整张图又灰又闷"。
+                        val rawBmp = frame?.toBitmap()
+                        // 条件必须和引擎那边完全一致（`di_active_ = digital_intermediate
+                        // && !scan_film`）：直扫底片时出的已经是"被扫描的底片画面"，
+                        // 不是 Cineon 码值，再套一遍 DI 视图就又灰一层。
+                        val diView = diActive && !scanFilm
+                        val b = if (rawBmp != null && diView) {
+                            val viewed = DiView.apply(rawBmp)
+                            if (viewed !== rawBmp) rawBmp.recycle()
+                            viewed
+                        } else rawBmp
                         Diagnostics.log("render", "    bitmap ${System.currentTimeMillis() - tb}ms")
                         result = b
+                        // 失败时把引擎自己的话留下：`spk_last_error` 里写着哪个节点、
+                        // 哪个 kernel 出的问题（例如 "Vulkan kernel not ported: …"）。
+                        if (b == null) {
+                            val why = runCatching { eng.lastError() }.getOrNull().orEmpty()
+                            renderFail = "冲洗失败：${why.ifBlank { "引擎没有给出原因" }}"
+                            mainHandler.post { status = renderFail }
+                            Diagnostics.log("render", "渲染返回空帧 ${why.take(200)}")
+                        } else renderFail = null
                         // [r37] 原帧的 16 bit 也留着：调色必须在它上面做，降到 8 bit 再
                         // 拉曲线就会空出色阶（见 Layer2.apply16 的注释）。渲染失败时清空，
                         // 免得拿上一张图的 16 bit 去套这一张的 8 bit。
-                        renderRaw = if (b != null) frame else null
+                        // [r49] DI 例外：16 bit 里是 Cineon 码值，而 base 已经过 DI 视图，
+                        // 两者不在同一个空间，套上去颜色会整体错 —— 这时一律走 8 bit。
+                        renderRaw = if (b != null && !diView) frame else null
                         // 只有渲染真的成功才记快照，否则下一次仍会走完整渲染
                         if (b != null) lastRenderedDelta.set(delta)
                         Diagnostics.log("render", "  render ${System.currentTimeMillis() - st}ms")
@@ -938,6 +1171,10 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                 Diagnostics.log("render", "异常: ${e.message} lastError=${runCatching { eng.lastError() }.getOrNull()}")
             } finally {
                 mainRenderPending = false
+                // 没出图就一定要把「进行中」的步骤清掉。以前只在成功路径上写 done，
+                // 失败时那一步一直 active，顶栏就停在「冲洗中 · 印放」不动了 ——
+                // 看上去像卡死，其实是早就失败了。只在失败时清，避免盖掉下一次渲染的 active。
+                if (result == null) mainHandler.post { progress = progress.map { it.copy(active = false) } }
             }
         }
         t.start()
@@ -1040,7 +1277,10 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
     // 保证界面永远能出图，不再需要杀进程。
     // 每一级的结论都写进日志 —— 这本身就是二分：哪一级开始能出图，祸首就是上一级剥掉的那个参数。
     fun renderWithHeal(eng0: SpektraEngine, sess0: Long, reason: String): Bitmap? {
-        val b0 = doRender(eng0, sess0, reason, 12000L)
+        // 数字中间片的首次渲染要在 CPU 上扫一遍中性楔（561 档 × 全光谱），比普通
+        // 印相多建一批常数；12 s 对它偏紧，超时会被当成"卡死"取消，画面停在上一帧 ——
+        // 用户看到的正是"开了 DI 以后预览定格"。给它 30 s。
+        val b0 = doRender(eng0, sess0, reason, if (diActive) 30000L else 12000L)
         if (b0 != null) return b0
         if (!renderWedged) return null
         Diagnostics.log("heal", "=== $reason 卡死，开始分级自救 ===")
@@ -1239,19 +1479,191 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                 if (e.initError != null) { engineError = "引擎初始化失败：${e.initError}"; Diagnostics.log("init", "create FAIL: ${e.initError}") }
                 else {
                     Diagnostics.log("init", "create OK")
-                    val testPx = generateTestFrame(960, 720)
-                    val s = e.open(testPx, 960, 720, 3, "{\"preview_long_edge\":1280}")
-                    session = s
-                    val b = doRender(e, s, "init")
-                    previewBase = b
-                    // [r9] 没导入照片时，网格里也先给出「每种胶片/相纸 × 内置测试图」的缩略图 ——
-                    // 256 px 一套只要几百毫秒，而且写在磁盘缓存里（key=builtin-test），
-                    // 之后每次冷启动直接命中。否则用户先看到的是 26 个空格子，会以为缩略图坏了。
-                    val ts0 = downsampleFloat(testPx, 960, 720, ThumbStore.SRC_EDGE)
-                    thumbSrc = ts0
-                    thumbPhotoKey = ThumbStore.BUILTIN_KEY
+                    // [r49.3] 冷启动「系统分享进来」为什么不渲染缩略图 —— 这是一条**竞态**，
+                    // 只有在分享冷启动时才成立（普通点「导入照片」时 init 早就跑完了）：
+                    //
+                    //   create OK(116ms) → engine 赋值 → 分享的 LaunchedEffect 立刻把图交给
+                    //   导入流程 → 导入线程在 412ms 设好 thumbSrc/thumbPhotoKey（真照片）
+                    //   → 而 init 这条线程还在跑测试帧，直到 875ms 才回来把 thumbSrc 和
+                    //   thumbPhotoKey **改回内置测试图 / BUILTIN_KEY**。
+                    //
+                    // 于是缩略图那一组拿着「测试图 + builtin-test」去渲、去查缓存，
+                    // 真照片的 34 张一张都不会出现 —— 用户看到的就是「分享进来，小预览没了」。
+                    // 顺带它还白占半秒引擎锁，把导入的首帧挤到后面。
+                    //
+                    // 两条处理：有待处理的图就整段跳过测试帧；就算跑完了，也只在 thumbSrc
+                    // 仍为空（=还没有真照片接手）时才认领它。
+                    if (pendingShare.value != null || pendingImport.value != null) {
+                        Diagnostics.log("init", "已有分享/导入待处理，跳过内置测试帧")
+                    } else {
+                        val testPx = generateTestFrame(960, 720)
+                        val s = e.open(testPx, 960, 720, 3, "{\"preview_long_edge\":1280}")
+                        session = s
+                        val b = doRender(e, s, "init")
+                        previewBase = b
+                        // [r9] 没导入照片时，网格里也先给出「每种胶片/相纸 × 内置测试图」的缩略图 ——
+                        // 256 px 一套只要几百毫秒，而且写在磁盘缓存里（key=builtin-test），
+                        // 之后每次冷启动直接命中。否则用户先看到的是 26 个空格子，会以为缩略图坏了。
+                        // [r49.3] 认领前再确认一次：这几百毫秒里分享/导入可能已经把真照片
+                        // 的 thumbSrc 设好了，绝不能再盖回测试图。
+                        if (thumbSrc == null && pendingImport.value == null && pendingShare.value == null) {
+                            val ts0 = downsampleFloat(testPx, 960, 720, ThumbStore.SRC_EDGE)
+                            thumbSrc = ts0
+                            thumbPhotoKey = ThumbStore.BUILTIN_KEY
+                        } else {
+                            Diagnostics.log("init", "测试帧已完成，但已有真照片接管缩略图源，不覆盖")
+                        }
+                    }
                 }
             } catch (t: Throwable) { engineError = t.stackTraceToString().take(1500); Diagnostics.log("init", "异常: ${t.message}") }
+        }
+    }
+
+    // 批量冲洗
+    var showBatch by remember { mutableStateOf(false) }
+    var batchUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var batchStates by remember { mutableStateOf<List<String>>(emptyList()) }
+    var batchRunning by remember { mutableStateOf(false) }
+    var batchStop by remember { mutableStateOf(false) }
+    // 胶片/相纸格的预览：**只有缩略图这一路**（r49.2）。
+    //
+    // 这里原来还有一条「实拍小样」支路（另开会话，给每个型号渲染一张 128 px），它一直
+    // 是死的，而且死得很安静：`preview_long_edge` 的合法区间是 800…8192（params.cpp
+    // 的 schema，诊断里那份 JSON 也写着），传 128 会被 validate_delta 当越界拒掉，
+    // setParams 抛异常 → runCatching 吞成 null → continue，一张都出不来。就算出来了
+    // 也不算同一张图 —— 它没带 input_color_space / input_cctf_decoding，引擎会把
+    // sRGB 像素按线性 ProPhoto 解释，又亮又平。
+    //
+    // 而它想做的事，格子里的缩略图（ThumbStore，同一张照片 × 每个胶片/相纸）已经在做，
+    // 而且更准：带自动曝光、只开主颗粒层、结果写磁盘缓存。所以这 26 次多余的开会话
+    // 和 26 句必然失败的 setParams 一起去掉，格子只认缩略图缓存。
+
+    val batchPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(50)
+    ) { uris ->
+        batchUris = uris
+        batchStates = uris.map { "等待" }
+    }
+
+    /** 批量冲洗：当前设置跑一遍选中的每张（逐张 open → 渲染 → 调色 → 写相册）。 */
+    fun runBatch() {
+        val eng0 = engine ?: run { status = "引擎未就绪"; return }
+        val photos = batchUris
+        if (photos.isEmpty()) return
+        val delta = buildDelta(inputRawOverride = false)
+        val toneNow = tone
+        val sceneNow = sceneCurve
+        batchRunning = true; batchStop = false
+        batchStates = photos.map { "等待" }
+        Thread {
+            var ok = 0
+            photos.forEachIndexed { i, uri ->
+                if (batchStop) return@forEachIndexed
+                mainHandler.post { batchStates = batchStates.toMutableList().also { it[i] = "冲洗中…" } }
+                var sess = 0L
+                try {
+                    val px0 = decodePhotoToFloat(ctx, uri) ?: throw IllegalArgumentException("解不开")
+                    val px = if (sceneNow.isIdentity) px0
+                             else Triple(SceneCurve.apply(px0.first, sceneNow), px0.second, px0.third)
+                    sess = withEngineGate(60000L, "batch open") {
+                        eng0.open(px.first, px.second, px.third, 3, "{\"preview_long_edge\":1280}")
+                    } ?: 0L
+                    if (sess == 0L) throw IllegalStateException("打开失败")
+                    val frame = withEngineGate(90000L, "batch render") {
+                        eng0.setParams(sess, delta)
+                        // 测光失败不该让这张作废（例如自动测光被关掉）：照当前曝光继续
+                        runCatching { eng0.solve(sess, "exposure") }
+                        eng0.renderFrame(sess, "full")
+                    } ?: throw IllegalStateException("渲染失败")
+                    // 影调（Layer 2）与主界面同一份配置，批量出的图和单张导出一致。
+                    // [r49.1] 数字中间片例外：引擎给的是 Cineon 码值，必须和预览/单张
+                    // 导出一样先过 DI 视图，而且 16 bit 通道里也是码值，不能拿来调色。
+                    // 之前这里直接 apply16 → 批量出来的 DI 片子是一批灰图。
+                    val diView = diActive && !scanFilm
+                    val toned = if (diView) {
+                        val raw = frame.toBitmap() ?: throw IllegalStateException("转换失败")
+                        val viewed = DiView.apply(raw)
+                        if (viewed !== raw) raw.recycle()
+                        if (toneNow.isIdentity) viewed else Layer2.apply(viewed, toneNow)
+                    } else runCatching { Layer2.apply16(frame.px, frame.w, frame.h, toneNow) }.getOrNull()
+                    val bmp: android.graphics.Bitmap = toned
+                        ?: (frame.toBitmap() ?: throw IllegalStateException("转换失败"))
+                    val nm = "Deyva_${java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())}_${i + 1}"
+                    val saved = saveJpegToGallery(ctx, bmp, nm)
+                    bmp.recycle()
+                    if (!saved) throw IllegalStateException("写入失败")
+                    ok++
+                    mainHandler.post { batchStates = batchStates.toMutableList().also { it[i] = "已保存" } }
+                } catch (t: Throwable) {
+                    Diagnostics.log("batch", "第 ${i + 1} 张失败: ${t.message}")
+                    mainHandler.post {
+                        batchStates = batchStates.toMutableList().also { it[i] = "失败：${t.message?.take(20)}" }
+                    }
+                } finally {
+                    if (sess != 0L) runCatching { eng0.sessionRelease(sess) }
+                }
+            }
+            mainHandler.post {
+                batchRunning = false
+                status = "批量冲洗完成：$ok / ${photos.size} 张"
+            }
+        }.start()
+    }
+
+    // 叠片：0 = 双重曝光，1 = 半格组
+    var compMode by remember { mutableIntStateOf(0) }
+    val compPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        val cur = photoData
+        if (uri == null) return@rememberLauncherForActivityResult
+        if (cur == null) { status = "请先导入一张照片，再来叠第二张"; return@rememberLauncherForActivityResult }
+        compositeBusy = true
+        status = if (compMode == 1) "正在拼半格组…" else "正在叠两次曝光…"
+        Thread {
+            try {
+                // 第二张按 sRGB 解码；RAW 的第一张先落到显示空间，两张才好相加
+                val second = decodePhotoToFloat(ctx, uri) ?: throw IllegalArgumentException("第二张解不开")
+                val first = if (photoIsRaw) {
+                    val b = makeThumb(cur.first, cur.second, cur.third, 3000, true)
+                        ?: throw IllegalArgumentException("第一张转显示空间失败")
+                    Composite.bitmapToFloats(b).also { b.recycle() }
+                } else Triple(cur.first, cur.second, cur.third)
+                val px = if (compMode == 1) Composite.halfFramePair(first, second, 2400)
+                         else Composite.doubleExposure(first, second, 1f, false)
+                val bmp = Composite.toBitmap(px.first, px.second, px.third)
+                    ?: throw IllegalArgumentException("合成失败")
+                val f = File(ctx.cacheDir, "composite_${System.currentTimeMillis()}.jpg")
+                java.io.FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.JPEG, 96, it) }
+                bmp.recycle()
+                Diagnostics.log("composite", "mode=$compMode ${px.second}x${px.third} -> ${f.name}")
+                mainHandler.post {
+                    if (compMode == 1) {
+                        overscanActive = true
+                        overscanFormat = "135_half"
+                        pairActive = true
+                        osCropCx = 0.5f; osCropCy = 0.5f; osZoom = 1f
+                    }
+                    compositeFrom = srcUri
+                    compositeBusy = false
+                    status = if (compMode == 1) "半格组已拼好，正在冲洗…" else "双重曝光已叠好，正在冲洗…"
+                    pendingImport.value = Uri.fromFile(f)
+                }
+            } catch (t: Throwable) {
+                Diagnostics.log("composite", "失败: ${t.message}")
+                mainHandler.post { compositeBusy = false; status = "叠片失败：${t.message}" }
+            }
+        }.start()
+    }
+    // [r48] 系统分享进来的图：**等引擎就绪**再交给导入流程。
+    // 冷启动分享时，图（已经在缓存里）比引擎初始化先到，直接塞 pendingImport 会撞上
+    // "引擎未就绪"然后把图丢掉；这里挂住，引擎一就绪立刻接上。
+    // 顺手把相册/观片台关掉：分享进来是要"看这张图"，新图不该被压在全屏页底下。
+    val shared = pendingShare.value
+    LaunchedEffect(shared, engine) {
+        if (shared != null && engine != null) {
+            showGallery = false
+            lightTablePhotos = null
+            pendingImport.value = shared
+            pendingShare.value = null
         }
     }
 
@@ -1276,7 +1688,7 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                     srcUri = pending
                     srcName = displayStemName(ctx, pending)
                     Diagnostics.log("import", "源片名=$srcName")
-                    val decoded: Triple<FloatArray, Int, Int>
+                    var decoded: Triple<FloatArray, Int, Int>
                     var rawInfo: RawSession? = null
                     if (photoIsRaw) {
                         // 解码与 spk_open 是同一个 JNI 调用，只能整段进闸门：r5 的
@@ -1303,11 +1715,27 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                         decoded = decodePhotoToFloat(ctx, pending)
                             ?: throw IllegalArgumentException("无法解码所选图片")
                     }
+                    // 解码曲线：只对栅格照片做（RAW 的像素在 native 会话里，拿不到 Java 数组）。
+                    // 每次导入都从"刚解出来的原片"上重算，所以反复应用不会层层叠加。
+                    // [r49.3] baseDecoded 留住**未套曲线**的那一份：长按「原图」要的是它
+                    // （以前这里是套完曲线再 makeThumb，所谓"原图"其实是套过解码曲线的图），
+                    // 场景重算也从它出发。SceneCurve.apply 返回新数组，原片本身不被改写，
+                    // 所以这里不需要额外复制，不涨内存。
+                    val baseDecoded = decoded
+                    if (!photoIsRaw && !sceneCurve.isIdentity) {
+                        decoded = Triple(SceneCurve.apply(decoded.first, sceneCurve), decoded.second, decoded.third)
+                        Diagnostics.log("scene", "解码曲线已应用 ev=${sceneCurve.ev} sh=${sceneCurve.shadow} hi=${sceneCurve.highlight}")
+                    }
+                    sceneApplied = if (photoIsRaw) SceneCurve.Cfg() else sceneCurve
                     // 解码成功，现在才放掉上一张的源数据与缩略图缓存（大 FloatArray，
                     // 否则连续导入会内存累积 OOM；不清 thumbCache 则新照片仍显示上一张）。
                     photoData = null
                     // [r38] 两层一起清：只清显示层的话，派生 effect 会立刻用旧照片的
                     // thumbBase 重新填回来，等于没清。
+                    // [r49.3] 必须同时把 thumbReq 推进一格：上一条照片的缩略图渲染可能
+                    // 还挂在引擎锁后面排队，它拿到锁后会往"新照片"的 key 里写旧图
+                    // （out 的 key 只有 胶片@相纸，没有照片指纹），画面上就是新图配旧样片。
+                    thumbReq++
                     thumbBase = emptyMap()
                     thumbCache = emptyMap()
                     photoData = decoded
@@ -1353,7 +1781,11 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                     session = s
                     // [r25] RAW 的 float 是线性 ProPhoto：这里的 true 让 makeThumb 补上
                     // ProPhoto→sRGB 矩阵与 sRGB 编码曲线，否则长按「原图」是一片死黑。
-                    photoBmp = makeThumb(decoded.first, decoded.second, decoded.third, 1600, photoIsRaw)
+                    // [r49.3] 用 baseDecoded（未套解码曲线）：长按要对比的是「原片」，
+                    // 不是"已经按当前曲线修过一遍"的图。
+                    photoBmp = makeThumb(baseDecoded.first, baseDecoded.second, baseDecoded.third, 1600, photoIsRaw)
+                    // 换了照片，上一张的取景位置没有意义：回到居中、不放大
+                    osCropCx = 0.5f; osCropCy = 0.5f; osZoom = 1f
                     setStep(0, true, false)
                     status = "已导入 ${sourceW}×${sourceH}，正在冲洗…"
                     val b = renderWithHeal(eng, s, "import")
@@ -1414,11 +1846,106 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                       else "校色：各片按自己的中性滤片配平（彩扩机做法，互相接近）"
     }
 
+    // [r49.3] 解码曲线：松手即重算，不用再去点「应用」。
+    //
+    // 原来这条曲线只有一个「应用」按钮，而且点了之后走的是**完整导入流程**
+    // （重新解码文件 → 清缩略图 → 重置取景 → 重读 EXIF）。于是拖动滑杆时画面
+    // 一动不动 —— 用户的原话就是「解码曲线好像没有效果」。更糟的是它连取景
+    // 位置都一起清了，改一次曲线等于把构图重来一遍。
+    //
+    // 现在只重算这一条曲线：读回原片 → 套曲线 → 重开会话 → 重渲染。取景、配方、
+    // EXIF、拍摄数据一概不动。缩略图那 34 张会跟着换一套（像素指纹变了），
+    // 但不清 thumbBase —— 旧样片先顶着，新图渲完逐张覆盖，格子里不会先闪空。
+    LaunchedEffect(sceneTick) {
+        if (sceneTick == 0) return@LaunchedEffect
+        // 导入正在跑：它会读**当前**的 sceneCurve 自己套一遍，这里再插一脚只会
+        // release 掉它刚开的会话。等下一次松手即可。
+        if (importBusy) {
+            Diagnostics.log("scene", "导入进行中，本次曲线重算跳过（导入会带最新曲线）")
+            return@LaunchedEffect
+        }
+        val eng0 = engine ?: run { status = "引擎未就绪"; return@LaunchedEffect }
+        val u = srcUri ?: run { status = "还没有照片可应用"; return@LaunchedEffect }
+        if (photoIsRaw) {
+            status = "RAW 的像素在引擎里，解码曲线要先重新导入原片才生效"
+            Diagnostics.log("scene", "跳过：RAW 没有可复算的 Java 侧像素")
+            return@LaunchedEffect
+        }
+        val cfg = sceneCurve
+        importBusy = true
+        status = "正在按解码曲线重算…"
+        // NonCancellable：连续松手时 LaunchedEffect 会取消上一轮，而上一轮可能正卡在
+        // 「释放旧会话 → 开新会话」中间。半路被取消的话 session 就停在 0，主图再也不会
+        // 更新。这里让它把手上的事做完，新一轮在闸门上排队即可（松手频率本来就低）。
+        withContext(Dispatchers.Default + kotlinx.coroutines.NonCancellable) {
+            try {
+                val px0 = decodePhotoToFloat(ctx, u) ?: throw IllegalStateException("解不开原片")
+                val px = if (cfg.isIdentity) px0
+                         else Triple(SceneCurve.apply(px0.first, cfg), px0.second, px0.third)
+                // 「原图」始终是未套曲线的原片
+                photoBmp = makeThumb(px0.first, px0.second, px0.third, 1600, false)
+                photoData = px
+                val small = downsampleFloat(px.first, px.second, px.third, ThumbStore.SRC_EDGE)
+                val newKey = photoFingerprint(small.first, small.second, small.third)
+                if (newKey != thumbPhotoKey) {
+                    thumbPhotoKey = newKey
+                    thumbReq++
+                    runCatching { ThumbStore.prune(ctx, newKey) }
+                }
+                thumbSrc = small
+                val s = withEngineGate(60000L, "scene open") {
+                    if (session != 0L) { runCatching { eng0.sessionRelease(session) }; session = 0L }
+                    eng0.open(px.first, px.second, px.third, 3, "{\"preview_long_edge\":1280}")
+                } ?: 0L
+                if (s == 0L) throw IllegalStateException("打开图片失败：${eng0.lastError()}")
+                session = s
+                sceneApplied = cfg
+                Diagnostics.log("scene", "重算 ev=${cfg.ev} sh=${cfg.shadow} hi=${cfg.highlight} key=$newKey")
+                val b = renderWithHeal(eng0, s, "scene")
+                if (b != null) {
+                    previewBase = b
+                    status = if (cfg.isIdentity) "解码曲线已复位（与原片一致）" else "解码曲线已应用"
+                } else {
+                    status = "解码曲线重算未出图，点「诊断」看日志"
+                }
+            } catch (t: Throwable) {
+                status = "解码曲线应用失败：${t.message}"
+                Diagnostics.log("scene", "重算失败: ${t.message}")
+            } finally { importBusy = false }
+        }
+    }
+
     LaunchedEffect(section, thumbSrc, thumbPhotoKey, importBusy, filmVariant, printVariant, filmTrueColor) {
         val ts = thumbSrc; val eng = engine; val pk = thumbPhotoKey
         if (ts != null && eng != null && !importBusy) {
             withContext(Dispatchers.Default) {
-                runCatching { renderMissingThumbs(eng, ts, pk, section, filmVariant, printVariant) }
+                // [r49.3] 「让位主渲染」以前是**一次性**的：缩略图渲染撞上主渲染就整组退出
+                // （renderThumbs 里 pendingFresh → break），而这个 effect 的 key 又不会再变，
+                // 于是那几格一直空到用户下次切胶片/相纸为止 —— 用户的话是「缩略图不渲染」。
+                // 冷启动分享最容易撞上：导入的首帧和缩略图几乎同时排队。
+                //
+                // 现在最多补 4 轮、每轮隔 1.2 s，缺多少渲多少；集齐（或重试用尽）就停。
+                // 判定"缺"用的是**当前这一组**的 key，不是 thumbBase 的总张数 ——
+                // 另一组（胶片页 26 / 相纸页 8）张数不同，不能混着算。
+                fun missingNow(): Int {
+                    val ids = if (section == 1) PRINT_VARIANTS else FILM_VARIANTS
+                    return ids.count { v ->
+                        val k = if (section == 0) "${v.id}@$printVariant" else "$filmVariant@${v.id}"
+                        thumbBase[k] == null
+                    }
+                }
+                repeat(4) { attempt ->
+                    if (!isActive) return@withContext
+                    runCatching { renderMissingThumbs(eng, ts, pk, section, filmVariant, printVariant) }
+                    val miss = missingNow()
+                    if (miss == 0) return@withContext
+                    if (attempt < 3) {
+                        Diagnostics.log("thumb", "还缺 $miss 格（section=$section 第${attempt + 1}轮），1200ms 后补渲")
+                        delay(1200L)
+                    } else {
+                        Diagnostics.log("thumb", "补渲 4 轮后仍缺 $miss 格（section=$section），等下次切换再试")
+                    }
+                }
             }
         }
     }
@@ -1451,22 +1978,34 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                 (if (prevOk) prev[k] else null) ?: Layer2.apply(b, tone)
             }
         }
-        thumbCache = conv
+        // [r49.2] 用 baseMap **打底**再盖调色结果。
+        // 以前是 `thumbCache = conv`：只要某一轮 conv 还没算完、或者算的过程中被打断，
+        // 显示层就整片清空 —— 格子里什么都不剩，看着就是"胶片和相纸的小预览没有了"。
+        // baseMap 本来就是引擎刚出的成片（只是没调色），拿它顶着永远比空着对：
+        // 用户看到的是一张正确的冲洗结果，而不是一块空片位。
+        thumbCache = baseMap + conv
         thumbTone = tone
     }
 
     val eng = engine
     // 去抖渲染：快速连续切换胶片/相纸时合并为最后一次渲染，避免每次 setParams(400-1500ms) 堆积卡顿
     LaunchedEffect(renderTick, filmVariant, printVariant, formatIdx, antihalationRemoved, filmTrueColor) {
-        if (session != 0L && eng != null) {
-            delay(250)
+        // [r49.3] 会话要在**延时之后**再读。这 250 ms 里可能刚发生过一次
+        // 「解码曲线重算」或「导入」—— 它们会 release 旧会话再开新的，
+        // 而启动时捕获的那个句柄此时已经失效，渲上去就是失败甚至崩在 native 里。
+        delay(250)
+        val sess = session
+        val e = engine
+        // 导入 / 场景重算正在进行：它们结束时会用最新参数自己渲一遍，这里让位，
+        // 免得两条线程抢同一把引擎闸门
+        if (sess != 0L && e != null && !importBusy) {
             withContext(Dispatchers.Default) {
                 // 卡死不再"打到死"：分级自救会逐级剥参数重试，直到能出图，
                 // 并且把"哪一级开始能出图"写进日志（这就是二分定位）。
-                val b = renderWithHeal(eng, session, "change")
+                val b = renderWithHeal(e, sess, "change")
                 if (b != null) previewBase = b
                 // 主渲染完成后补渲被让位中断的缩略图
-                thumbSrc?.let { ts -> renderMissingThumbs(engine ?: eng, ts, thumbPhotoKey, section, filmVariant, printVariant) }
+                thumbSrc?.let { ts -> renderMissingThumbs(engine ?: e, ts, thumbPhotoKey, section, filmVariant, printVariant) }
             }
         }
     }
@@ -1490,6 +2029,13 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
     // 第一次进来把手是琥珀色的（"这里可以拖"），动过一次就变回普通白
     var sheetHint by remember { mutableStateOf(true) }
     val sheetScope = rememberCoroutineScope()
+
+    // 已导出胶片条数：给"更多"里的入口显示数量；每次导出后由导出线程 +1
+    LaunchedEffect(exportsTick) {
+        exportsCount = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { ExportStore.load(ctx).size }.getOrDefault(0)
+        }
+    }
 
     // 状态提示自动退场：成功类 4.5s 后消失，免得一条"冲洗完成"永远压在画面上；
     // 失败/卡死类保留，因为那就是用户需要读到的东西。
@@ -1572,10 +2118,42 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
         else if (step == 2 && ms < 12) toneFast = false
     }
 
-    // 预览 HDR：开关开启时把预览叠加高光恢复（与导出 gain map 同一曲线），后台计算避免卡顿
+    // ---- 预览 HDR（r49）----
+    //
+    // 有 HDR 面板就走**真的**：把预览写成 RGBA_F16 + EXTENDED_SRGB（scRGB）位图，
+    // 再把窗口切到 COLOR_MODE_HDR —— 高光的值可以真的超过 1.0，屏幕上就有比界面白
+    // 更亮的东西。观片台的灯箱用的是同一套机制（LtHdr）。
+    //
+    // 没有 HDR 面板（API<34、屏不支持、或 F16 位图建不出来）时退回旧的"SDR 模拟"：
+    // 同一条曲线、峰值降到 1.5×，压进 0~1 显示。两条路都用 UltraHdrJpeg 里那**一条**
+    // 曲线，预览与导出不会各自漂移。
+    var hdrPanel by remember { mutableStateOf(false) }
+    var hdrPrevMode by remember { mutableIntStateOf(ActivityInfo.COLOR_MODE_DEFAULT) }
     LaunchedEffect(preview, previewHdr) {
-        hdrPreviewBmp = if (previewHdr && preview != null)
-            withContext(Dispatchers.Default) { UltraHdrJpeg.hdrLook(preview!!) } else null
+        val src = preview
+        if (!previewHdr || src == null) {
+            if (hdrPanel) { LtHdr.exit(ctx as? Activity, hdrPrevMode); hdrPanel = false }
+            hdrPreviewBmp = null
+            return@LaunchedEffect
+        }
+        val hdr = withContext(Dispatchers.Default) { UltraHdrJpeg.hdrLookHdr(src) }
+        if (hdr != null) {
+            if (!hdrPanel) {
+                hdrPrevMode = LtHdr.prevMode(ctx as? Activity)
+                hdrPanel = LtHdr.supported(ctx) && LtHdr.enter(ctx as? Activity)
+            }
+            if (hdrPanel) { hdrPreviewBmp = hdr; return@LaunchedEffect }
+            if (!hdr.isRecycled) hdr.recycle()
+        }
+        // 兜底：切不进 HDR（或 F16 建不出来）就退回 SDR 模拟，绝不因此把预览弄黑
+        if (hdrPanel) { LtHdr.exit(ctx as? Activity, hdrPrevMode); hdrPanel = false }
+        hdrPreviewBmp = withContext(Dispatchers.Default) { UltraHdrJpeg.hdrLook(src) }
+    }
+    // 离开这一页时一定要把窗口模式还原，否则整个 App 都会停在 HDR（SDR 界面会发灰）
+    DisposableEffect(Unit) {
+        onDispose {
+            if (hdrPanel) { LtHdr.exit(ctx as? Activity, hdrPrevMode); hdrPanel = false }
+        }
     }
 
     Scaffold(containerColor = Dv.root) { pad ->
@@ -1691,7 +2269,26 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                             contentScale = ContentScale.Fit)
                         engineError != null -> Text(engineError ?: "", color = Dv.red, fontSize = 11.sp,
                             modifier = Modifier.padding(16.dp))
+                        // 失败要说出来：没有这一支，引擎返回空帧时这里就是一个永远不停的圈，
+                        // 用户只能得出"卡住了"的结论（数字中间片以前正是这样）。
+                        renderFail != null -> Text(renderFail ?: "", color = Dv.red, fontSize = 11.sp,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            modifier = Modifier.padding(24.dp))
                         else -> CircularProgressIndicator(color = Dv.accent, strokeWidth = 2.dp)
+                    }
+                    // 失败必须能看见 —— 即使上一帧还挂在屏幕上。旧行为是"bmp 非空就不显示
+                    // 错误"，于是渲染失败只表现为"画面不动了"：开数字中间片后切相纸没反应，
+                    // 看起来像功能没生效，实际是整帧都失败了。这条浮层把引擎原话摆出来。
+                    if (renderFail != null && bmp != null) {
+                        Box(
+                            Modifier.align(Alignment.TopCenter).padding(top = 10.dp, start = 12.dp, end = 12.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(Color(0xCC2A0F0F))
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Text(renderFail ?: "", color = Dv.red, fontSize = 10.sp, maxLines = 3,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                        }
                     }
                     // 长按看原图：玻璃小标签（90ms 淡入 / 140ms 淡出，出得比进得快是 iOS 惯例）
                     androidx.compose.animation.AnimatedVisibility(
@@ -1705,9 +2302,9 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                             Text("原图 · 松手返回成片", color = Dv.label1, fontSize = 10.5f.sp)
                         }
                     }
-                    // HDR 预览开关（默认关）。[r27] 明确叫「模拟」：这里只是把 SDR 位图
-                    // 按导出 gain map 的同一条高光曲线提亮，画在普通 ARGB_8888 上，
-                    // 并没有把屏幕切成 HDR 模式，也不是在解码文件里的增益图。
+                    // HDR 预览开关（默认关）。[r49] 有 HDR 面板时这是**真 HDR**：
+                    // 窗口在 COLOR_MODE_HDR，画面是 scRGB 的 F16 位图，高光真的比界面白亮。
+                    // 没有 HDR 面板时退回"SDR 模拟"（同一条曲线压进 0~1），标签也会变。
                     Box(Modifier.align(Alignment.TopEnd).padding(12.dp).clip(RoundedCornerShape(14.dp))
                         .background(if (previewHdr) Dv.accentSoft else Dv.glassBar)
                         .border(1.dp, if (previewHdr) Dv.accent.copy(alpha = 0.55f) else Color.White.copy(alpha = 0.08f),
@@ -1718,7 +2315,8 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                             Box(Modifier.size(5.dp).clip(CircleShape)
                                 .background(if (previewHdr) Dv.accent else Dv.label3))
                             Spacer(Modifier.width(6.dp))
-                            Text("HDR 模拟", color = if (previewHdr) Dv.accent else Dv.label2,
+                            Text(if (previewHdr && hdrPanel) "HDR" else "HDR 模拟",
+                                color = if (previewHdr) Dv.accent else Dv.label2,
                                 fontSize = 10.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 1.2.sp)
                         }
                     }
@@ -1834,6 +2432,10 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                                 fontSize = 9.5f.sp, fontFamily = Dv.mono)
                         }
                     }
+                    // [r50] 已导出胶片：一枚片条图标。放在重置左边 —— 它是"翻看"，不是"改动"，
+                    // 与右边两个改动类按钮（重置 / 更多）隔着导出键，误触代价为零。
+                    DvIconButton(Glyph.Roll, "已导出胶片", box = 40.dp, glyphSize = 19.dp,
+                        tint = Dv.label2, onClick = { showExports = true })
                     DvIconButton(Glyph.Undo, "重置参数", box = 40.dp, glyphSize = 19.dp,
                         tint = Dv.label2, onClick = { showResetConfirm = true })
                     DvIconButton(Glyph.More, "更多", box = 40.dp, glyphSize = 20.dp,
@@ -1860,13 +2462,33 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                 Box(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
                     when (tab) {
                         0 -> FilmPaperTab(
-                            thumbCache = thumbCache,
+                            // 格子的图一律来自缩略图缓存；「实拍小样」那条死支路已删（见上）。
+                            // [r49.2] 传的是 **thumbBase + thumbCache**：调色那一轮还没算完
+                            // 时 thumbCache 可能是空的，而 thumbBase 里已经有引擎刚出好的
+                            // 图 —— 拿它顶着，格子永远不会整片变空片位。
+                            thumbCache = if (thumbCache.isEmpty()) thumbBase
+                                         else thumbBase + thumbCache,
                             section = section, onSection = { section = it; thumbReq++ },
                             filmVariant = filmVariant, onFilmVariant = { filmVariant = it; renderTick++ },
                             printVariant = printVariant,
-                            // 点相纸 = 明确要印这张相纸，于是关掉直扫底片（上游同规则）
-                            onPrintVariant = { printVariant = it; if (scanFilm) scanFilm = false; renderTick++ },
-                            scanFilm = scanFilm, onScanFilm = { scanFilm = it; renderTick++ },
+                            // 点相纸 = 明确要印这张相纸，于是关掉直扫底片**和**数字中间片
+                            // （上游同规则：scan_film 优先于 DI，DI 又完全绕过相纸）。
+                            // [r49] 以前只关直扫、不关 DI，DI 开着时点任何相纸都没反应 ——
+                            // 那就是用户看到的"点了相纸效果不变"。
+                            onPrintVariant = {
+                                printVariant = it
+                                scanFilm = false
+                                diActive = false
+                                renderTick++
+                            },
+                            // [r49] 打开直扫底片时也要把 DI 关掉。两个开关在 UI 上本来就互斥
+                            // （DI 的选中态是 `diActive && !scanFilm`），但以前只改了显示、
+                            // 没改状态：直扫一关，DI 又"自己亮回来"，看着像卡住。
+                            scanFilm = scanFilm,
+                            onScanFilm = { scanFilm = it; if (it) diActive = false; renderTick++ },
+                            diActive = diActive,
+                            // 选相纸/开片边都该关掉中间片：它们是两条互斥的"出片终点"
+                            onDi = { diActive = it; if (it) scanFilm = false; renderTick++ },
                             exposureEv = exposureEv, onEvChange = { exposureEv = it }, onEvCommit = { renderTick++ },
                             filmTrueColor = filmTrueColor, onFilmTrueColor = { filmTrueColor = it },
                             reduceMotion = reduceMotion,
@@ -1900,16 +2522,53 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                             // [r38] 负片反差：SHOOT 层，松手才重冲负片
                             densityGamma = densityGamma, onDensityGamma = { densityGamma = it },
                             onDensityGammaCommit = { renderTick++ },
+                            sceneCurve = sceneCurve, onSceneCurve = { sceneCurve = it },
+                            sceneApplied = sceneApplied == sceneCurve,
+                            // RAW 没有 Java 侧像素，这条曲线在宿主侧无从下手 —— UI 要如实禁用
+                            sceneSupported = !photoIsRaw,
+                            // [r49.3] 松手就重算：滑杆的 onValueChangeFinished 和「应用」
+                            // 按钮现在是同一条路 —— 都只是把 sceneTick 推一格，
+                            // 由下面的 effect 用原片重跑曲线。
+                            onSceneCommit = { sceneTick++ },
+                            onApplySceneCurve = { sceneTick++ },
+                            pairActive = pairActive, compositeBusy = compositeBusy,
+                            onDoubleExposure = {
+                                compMode = 0
+                                compPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                            },
+                            onHalfFramePair = {
+                                compMode = 1
+                                compPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                            },
+                            onPairOff = { pairActive = false; renderTick++ },
+                            canUndoComposite = compositeFrom != null,
+                            onUndoComposite = {
+                                compositeFrom?.let { u ->
+                                    pairActive = false; compositeFrom = null
+                                    if (srcUri == u) status = "这已经是叠片前那张" else pendingImport.value = u
+                                }
+                            },
                             overscanActive = overscanActive, onOverscanActive = { on ->
                                 // 开启片边时按当前照片比例自动匹配最接近的 gate 格式，避免照片被大量裁切破坏画面
-                                if (on) { overscanFormat = osBestFormat(sourceW, sourceH); forceNoOverscan = false }
+                                if (on) {
+                                    overscanFormat = osBestFormat(sourceW, sourceH)
+                                    forceNoOverscan = false
+                                    // 换门幅就回到居中：上一支片幅的取景位置对不上新门
+                                    osCropCx = 0.5f; osCropCy = 0.5f; osZoom = 1f
+                                }
+                                if (!on) pairActive = false
                                 overscanActive = on; renderTick++
                             },
                             overscanFormat = overscanFormat, onOverscanFormat = {
                                 // [r5] 换片幅就把"临时省略边码文字"撤销：上一片幅卡住不代表这一片幅也卡
                                 forceNoEdgeText = false
-                                overscanFormat = it; renderTick++
+                                pairActive = false
+                                overscanFormat = it
+                                // 门幅变了，能放下的窗口也变了：取景回到居中
+                                osCropCx = 0.5f; osCropCy = 0.5f; osZoom = 1f
+                                renderTick++
                             },
+                            onOpenFrame = { showOsFrame = true },
                             overscanFog = overscanFog, onOverscanFog = { overscanFog = it }, onOverscanFogCommit = { renderTick++ },
                             overscanLeaks = overscanLeaks, onOverscanLeaks = { overscanLeaks = it }, onOverscanLeaksCommit = { renderTick++ },
                             overscanGate = overscanGate, onOverscanGate = { overscanGate = it; renderTick++ },
@@ -1997,6 +2656,14 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                                 glyphSize = 16.dp, bg = Dv.panelRaised)
                         }
                         Hairline(alpha = 0.07f)
+                        ActionRow(if (exportsCount > 0) "已导出胶片（$exportsCount）" else "已导出胶片…") {
+                            showMore = false
+                            showExports = true
+                        }
+                        ActionRow("批量冲洗…") {
+                            showMore = false
+                            showBatch = true
+                        }
                         ActionRow("复制成片到相册") {
                             showMore = false
                             val bmp = preview
@@ -2556,13 +3223,24 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                                         //  · EXIF 里的尺寸与指纹都取自 full，晚套一层就全错位了。
                                         // 用的是和预览完全相同的 Layer2 —— 预览看到什么就导出什么。
                                         // [r37] 优先走 16 bit：全尺寸导出是断层最容易被看见的地方。
-                                        val full = if (tone.isIdentity) fullRaw else
-                                            (Layer2.apply16(out16.px, out16.w, out16.h, tone)
-                                                ?: Layer2.apply(fullRaw, tone))
+                                        // [r49] DI 的全尺寸帧同样是 Cineon 码值：先过 DI 视图
+                                        // 再调色。视图之后它就是普通的 sRGB 图，后面导出的
+                                        // 每一步（调色 / 尺寸 / EXIF / HDR 增益图）都不需要再
+                                        // 知道"这是不是 DI"。16 bit 那条路要跳过 —— 那里面是码值。
+                                        // 条件与预览/引擎同一条：DI 而且不是直扫底片。
+                                        val diView = diActive && !scanFilm
+                                        val fullBase = if (diView) {
+                                            val v = DiView.apply(fullRaw)
+                                            if (v !== fullRaw) fullRaw.recycle()
+                                            v
+                                        } else fullRaw
+                                        val full = if (tone.isIdentity) fullBase else
+                                            (if (!diView) Layer2.apply16(out16.px, out16.w, out16.h, tone) else null)
+                                                ?: Layer2.apply(fullBase, tone)
                                         if (!tone.isIdentity) {
                                             Diagnostics.log("export", "Layer2 已应用 ${full.width}x${full.height} " +
                                                 "色温=${"%.0f".format(tone.temp)} 对比=${"%.0f".format(tone.contrast)} " +
-                                                "曲线=${if (tone.curveRgb != Layer2.LINEAR) "已改" else "线性"} " +
+                                                "曲线=${if (!Layer2.isLinear(tone.curveRgb)) "已改（${Layer2.pointCount(tone.curveRgb)} 点）" else "线性"} " +
                                                 "暗角=${"%.0f".format(tone.vignette)}")
                                         }
                                         var out = full
@@ -2573,7 +3251,13 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                                         val srcExif = ExifInherit.read(ctx, srcUri)
                                         fun exportMeta(mw: Int, mh: Int): String = buildString {
                                             append("胶片: ${labelOf(filmVariant)}")
-                                            append(if (scanFilm) " · 直扫底片（未经相纸）" else " · 相纸: ${labelOf(printVariant)}")
+                                            append(
+                                                when {
+                                                    scanFilm -> " · 直扫底片（未经相纸）"
+                                                    diActive -> " · 数字中间片（平扫，不经相纸）"
+                                                    else -> " · 相纸: ${labelOf(printVariant)}"
+                                                }
+                                            )
                                             append("\n曝光: ${"%.1f".format(exposureEv)} EV")
                                             append("\n颗粒: ${"%.2f".format(grainAmount)}×")
                                             append("\n光晕: ${"%.2f".format(halationAmount)}×")
@@ -2587,8 +3271,8 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                                                     " · 曝光 ${"%.2f".format(tone.exposure)} EV" +
                                                     " · 对比 ${"%.0f".format(tone.contrast)}" +
                                                     " · 饱和 ${"%.0f".format(tone.saturation)}")
-                                                if (tone.curveRgb != Layer2.LINEAR || tone.curveR != Layer2.LINEAR ||
-                                                    tone.curveG != Layer2.LINEAR || tone.curveB != Layer2.LINEAR)
+                                                if (!Layer2.isLinear(tone.curveRgb) || !Layer2.isLinear(tone.curveR) ||
+                                                    !Layer2.isLinear(tone.curveG) || !Layer2.isLinear(tone.curveB))
                                                     append(" · 曲线已调")
                                                 if (tone.vignette != 0f)
                                                     append(" · 暗角 ${"%.0f".format(tone.vignette)}")
@@ -2613,7 +3297,11 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                                             // [r37] 高光帧也留一份 16 bit，调色要和主图走同一精度
                                             var hdrFrame16: Frame16? = null
                                             var evStep = 0.0
-                                            if (photoIsRaw) {
+                                            // [r49] DI 时不开双帧：第二帧同样是 Cineon 码值，
+                                            // 而主图已经过 DI 视图，两者的"纸白/趾部"参照完全不同，
+                                            // 查表算出来的增益是错的（会把高光推成一片白）。DI 本来
+                                            // 就是给调色用的平扫，不叠高光恢复才是对的。
+                                            if (photoIsRaw && !diActive) {
                                                 val pe0 = printExposure
                                                 val pe1 = (pe0 * 8f).coerceIn(0.05f, 20f)
                                                 evStep = Math.log((pe1 / pe0).toDouble()) / Math.log(2.0)
@@ -2642,7 +3330,9 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                                                         "加不了档（$pe0→$pe1）")
                                                 }
                                             } else {
-                                                Diagnostics.log("export", "HDR 单帧：输入不是 RAW，没有超出纸白的余量可读")
+                                                Diagnostics.log("export",
+                                                    if (diActive) "HDR 单帧：数字中间片是平扫母版，不叠高光恢复"
+                                                    else "HDR 单帧：输入不是 RAW，没有超出纸白的余量可读")
                                             }
                                             // [r33] 高光帧也要过同一套调色。它是同一张负片、同一台
                                             // 放大机印的，只是曝光多三档 —— 扫描之后的调色当然要一致。
@@ -2762,6 +3452,38 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
                                                 status = if (ok) "已导出成片（${fmt.label}→${actualExt}·${out.width}×${out.height}）" else "导出失败"
                                             }
                                         }
+                                        // [r50] 导出成功就留一条冲洗记录：胶片、相纸、曝光、
+                                        // 颗粒、光晕、片边、尺寸……都在这条记录里，底部片条按钮
+                                        // 打开就是这一张的完整档案。记录失败不影响"已导出"。
+                                        if (exportOk == true) {
+                                            runCatching {
+                                                ExportStore.record(
+                                                    ctx = ctx, bmp = out,
+                                                    filmId = filmVariant, filmLabel = labelOf(filmVariant),
+                                                    printId = if (scanFilm || diActive) "" else printVariant,
+                                                    printLabel = labelOf(printVariant),
+                                                    mode = when {
+                                                        scanFilm -> "直扫底片"
+                                                        diActive -> "数字中间片"
+                                                        else -> "相纸"
+                                                    },
+                                                    exposureEv = exposureEv,
+                                                    grain = grainAmount, halation = halationAmount,
+                                                    edge = if (overscanActive) osFormatShort(overscanFormat) else "—",
+                                                    colorSpace = renderColor,
+                                                    formatLabel = fmt.label,
+                                                    destination = when (saveDest) {
+                                                        0 -> "照片"; 1 -> "文件"; else -> "分享"
+                                                    },
+                                                    mediaUri = "",
+                                                    name = "$name.${fmt.ext}",
+                                                    shotInfo = photoDataLine,
+                                                )
+                                            }.onSuccess { rec ->
+                                                if (rec != null) android.os.Handler(android.os.Looper.getMainLooper())
+                                                    .post { exportsTick++ }
+                                            }
+                                        }
                                         val note = exportNote
                                         if (note != null) {
                                             val cur = status ?: ""
@@ -2813,6 +3535,48 @@ fun SpektraScreen(onPickPhoto: () -> Unit, onPickFile: () -> Unit, pendingImport
             }) { Text("复制全文", color = Orange) } },
             dismissButton = { TextButton({ showLog = false }) { Text("关闭", color = Dv.label2) } })
     }
+    // 片边取景页：门幅固定，画面可拖动/缩放。只在有照片、且开了片边时出现
+    if (showOsFrame) {
+        val osBmp = photoBmp
+        if (osBmp != null) {
+            OverscanFrameEditor(
+                src = osBmp.asImageBitmap(),
+                format = overscanFormat,
+                cx0 = osCropCx, cy0 = osCropCy, zoom0 = osZoom,
+                stockLabel = FILM_VARIANTS.firstOrNull { it.id == filmVariant }?.label ?: "",
+                onFormat = { f -> overscanFormat = f },
+                onCancel = { showOsFrame = false },
+                onConfirm = { x, y, z ->
+                    osCropCx = x; osCropCy = y; osZoom = z
+                    showOsFrame = false
+                    renderTick++
+                }
+            )
+        }
+    }
+    if (showBatch) BatchSheet(
+        uris = batchUris,
+        states = batchStates,
+        running = batchRunning,
+        onPick = {
+            batchPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+        },
+        onStart = { runBatch() },
+        onStop = { batchStop = true },
+        onClose = { if (!batchRunning) { showBatch = false; batchStop = false } },
+    )
+
+    // [r50] 已导出胶片 + live 工作室。都是铺满的普通 Composable（不是 Dialog）：
+    // 侧滑返回才能逐级退（live → 列表 → 编辑器），而不是直接退回桌面。
+    if (showExports) ExportedFilmsPage(
+        onClose = { showExports = false },
+        onOpenLive = { rec, st -> livePair = rec to st },
+        refreshKey = exportsTick,
+    )
+    livePair?.let { (rec, st) ->
+        LiveStudioPage(rec, st, onBack = { livePair = null })
+    }
+
     if (showGallery) GalleryPage(
         onClose = { showGallery = false },
         onOpenLightTable = { list -> lightTablePhotos = list; showGallery = false }
@@ -2831,6 +3595,8 @@ fun labelOf(variantId: String): String =
 internal fun osFormatKey(label: String): String = when (label) {
     "135 Half" -> "135_half"
     "135 宽幅" -> "135_xpan"
+    "110 13×17" -> "110"
+    "APS 16.7×30" -> "aps"
     "120 6×4.5" -> "120_645"
     "120 6×6" -> "120_6x6"
     "120 6×7" -> "120_6x7"
@@ -2842,8 +3608,11 @@ internal fun osFormatKey(label: String): String = when (label) {
 }
 
 // 片边门幅的长/短比（与 overscan_port.cpp 的 kFormats 实测 gate 尺寸一致，非臆想）
-private fun osGateRatio(format: String): Double = when (format) {
+internal fun osGateRatio(format: String): Double = when (format) {
     "135_half" -> 24.0 / 18.0          // gate 24×18（portrait 半幅）
+    "110" -> 17.0 / 13.0               // gate 17×13
+    "aps" -> 30.2 / 16.7               // gate 30.2×16.7
+    "135_half_pair" -> 37.0 / 24.0     // 半格组：两格 18 + 1 mm 间隔
     "120_645" -> 56.0 / 41.5           // gate 56×41.5（Mamiya）
     "120_6x6" -> 1.0                   // 方幅 56×56
     "120_6x7" -> 69.5 / 56.0           // gate 69.5×56
@@ -2863,7 +3632,7 @@ private fun osBestFormat(w: Int, h: Int): String {
         "135" to 36.25 / 24.3, "135_half" to 24.0 / 18.0, "120_645" to 56.0 / 41.5,
         "120_6x6" to 1.0, "120_6x7" to 69.5 / 56.0, "120_6x8" to 76.0 / 56.0,
         "120_6x9" to 84.0 / 56.0, "135_xpan" to 65.0 / 24.0, "120_6x12" to 112.0 / 56.0,
-        "120_6x17" to 168.0 / 56.0
+        "120_6x17" to 168.0 / 56.0, "110" to 17.0 / 13.0, "aps" to 30.2 / 16.7
     ).minBy { kotlin.math.abs(it.second - r) }.first
 }
 
@@ -3235,7 +4004,7 @@ private fun readExifAperture(ctx: Context, uri: Uri): Float = runCatching {
 }.getOrDefault(0f)
 
 // 拿 Uri 的真实文件名（photopicker 尾段只有数字），用于 RAW 扩展名检测
-private fun rawDisplayName(ctx: Context, uri: Uri): String {
+internal fun rawDisplayName(ctx: Context, uri: Uri): String {
     var name = uri.lastPathSegment?.lowercase() ?: ""
     runCatching {
         ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->

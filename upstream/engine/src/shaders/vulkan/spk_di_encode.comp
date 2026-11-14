@@ -1,0 +1,89 @@
+#version 450
+
+// RFC-028's Digital Intermediate, the last of its three passes, translated
+// from nodes.metal (`spk_di_encode`). The Metal original is the reference;
+// this keeps the same operand order so the two produce identical pixels.
+//
+// In: the positive as log10 per film channel. p: [0..8] film RGB -> working
+// RGB (x @ M), [9..11] the live log10 offsets, [12..20] working RGB -> Oklab
+// LMS and [21..29] back (M @ v), [30] compensation on, [31] hue rotation
+// (deg), [32] chroma scale, [33..36] hue centre, half width, chroma lo/hi,
+// [37..39] Cineon white, codes per decade, max code, [40] the positive of
+// clear base (subtracted: the base is black), [41] Cineon's black offset.
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer Input { float value[]; } y_in;
+layout(set = 0, binding = 1, std430) readonly buffer Params { float value[]; } p;
+layout(set = 0, binding = 2, std430) readonly buffer Meta { uint value[]; } meta;
+layout(set = 0, binding = 3, std430) writeonly buffer Output { float value[]; } out_data;
+
+// vulkan_gpu.cpp folds a dispatch past maxComputeWorkGroupCount[0] (65535 on
+// lavapipe and Intel) into rows of workgroups; this is the 1D index it means.
+layout(push_constant) uniform SpkDispatch { uint base; uint origin; uint read_bias; } spk_pc;
+uint spk_global_index() {
+    return spk_pc.base + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x) + gl_GlobalInvocationID.x;
+}
+
+void main() {
+    uint i = spk_global_index();
+    if (i >= meta.value[0]) return;
+
+    // The live print controls arrive as log offsets: brightness multiplies all
+    // three, the filters one or two. They are added before the 10^x so a gain
+    // never touches the base subtraction below in a different way.
+    vec3 pos = vec3(pow(10.0, y_in.value[3u * i] + p.value[9]),
+                    pow(10.0, y_in.value[3u * i + 1u] + p.value[10]),
+                    pow(10.0, y_in.value[3u * i + 2u] + p.value[11]));
+    // The base is black: the same floor on every channel, scaled with the
+    // live gain so brightness and the filters never lift it.
+    pos -= vec3(p.value[40]) * vec3(pow(10.0, p.value[9]),
+                                    pow(10.0, p.value[10]),
+                                    pow(10.0, p.value[11]));
+    vec3 lin = vec3(pos.x * p.value[0] + pos.y * p.value[3] + pos.z * p.value[6],
+                    pos.x * p.value[1] + pos.y * p.value[4] + pos.z * p.value[7],
+                    pos.x * p.value[2] + pos.y * p.value[5] + pos.z * p.value[8]);
+    if (p.value[30] != 0.0) {
+        // Oklab (Ottosson 2020); the window sits on the output hue and fades
+        // out below a chroma floor, so greys and every other hue are exact.
+        vec3 lms = vec3(p.value[12] * lin.x + p.value[13] * lin.y + p.value[14] * lin.z,
+                        p.value[15] * lin.x + p.value[16] * lin.y + p.value[17] * lin.z,
+                        p.value[18] * lin.x + p.value[19] * lin.y + p.value[20] * lin.z);
+        lms = pow(max(lms, vec3(0.0)), vec3(1.0 / 3.0));
+        float L = 0.2104542553 * lms.x + 0.7936177850 * lms.y - 0.0040720468 * lms.z;
+        float a = 1.9779984951 * lms.x - 2.4285922050 * lms.y + 0.4505937099 * lms.z;
+        float b = 0.0259040371 * lms.x + 0.7827717662 * lms.y - 0.8086757660 * lms.z;
+        float C = sqrt(a * a + b * b);
+        float h = degrees(atan(b, a));
+        float d = mod(h - p.value[33] + 540.0, 360.0) - 180.0;
+        float w = abs(d) < p.value[34] ? 0.5 * (1.0 + cos(3.14159265358979 * d / p.value[34])) : 0.0;
+        float g = clamp((C - p.value[35]) / (p.value[36] - p.value[35]), 0.0, 1.0);
+        w *= g * g * (3.0 - 2.0 * g);
+        if (w > 0.0) {
+            float h2 = radians(h + w * p.value[31]);
+            float C2 = C * (1.0 + w * (p.value[32] - 1.0));
+            a = C2 * cos(h2);
+            b = C2 * sin(h2);
+            vec3 l_ = vec3(L + 0.3963377774 * a + 0.2158037573 * b,
+                           L - 0.1055613458 * a - 0.0638541728 * b,
+                           L - 0.0894841775 * a - 1.2914855480 * b);
+            lms = l_ * l_ * l_;
+            lin = vec3(p.value[21] * lms.x + p.value[22] * lms.y + p.value[23] * lms.z,
+                       p.value[24] * lms.x + p.value[25] * lms.y + p.value[26] * lms.z,
+                       p.value[27] * lms.x + p.value[28] * lms.y + p.value[29] * lms.z);
+        }
+    }
+    // Kodak's Cineon encode with the black offset (`log_encoding_Cineon`).
+    // log10, not the natural log: the Metal original is `log10` and the
+    // constant (300 codes per decade) is calibrated against it.
+    //
+    // [DEYVA r49] 除以 ln(10) 的**只有 log 那一项**。旧版把整个分子（连 685 这个
+    // 白点常数）一起除了 2.3026，等于把白点从 685/1023 = 0.67 挪到 0.29：
+    // 纸白落在 74/255，中灰落在 20/255，0.05 以下整段被 clamp 成 0 ——
+    // 这就是"数字中间片一开就死黑"的全部原因（不是相纸、不是曲线）。
+    // 等价写法：(685*ln10 + 300*ln(v)) / (1023*ln10)。
+    vec3 code = (p.value[37] + p.value[38] * log(max(lin, vec3(0.0)) * (1.0 - p.value[41]) + p.value[41]) /
+                2.302585092994046) / p.value[39];
+    code = clamp(code, vec3(0.0), vec3(1.0));
+    out_data.value[3u * i] = code.x;
+    out_data.value[3u * i + 1u] = code.y;
+    out_data.value[3u * i + 2u] = code.z;
+}

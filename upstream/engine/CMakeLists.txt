@@ -120,7 +120,7 @@ if(NOT APPLE)
             spk_lognormal_field spk_rng_probe spk_mul spk_glare_add
             spk_reduce_max spk_boost spk_bw_correct spk_edr spk_cctf_decode
             spk_zoom_bilinear_mirror spk_geometry_resample_df
-            spk_lut3d_trilinear spk_di_normalise
+            spk_lut3d_trilinear spk_di_normalise spk_di_encode
             spk_overscan_canvas spk_overscan_add_mask
             spk_overscan_film_present spk_overscan_light
             spk_mask_reduce spk_mask_epilogue

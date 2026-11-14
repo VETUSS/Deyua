@@ -4,16 +4,21 @@
 // [DEYVA r34] The contrast mask (RFC-024) has left this list: its host half
 // compiles everywhere now (contrast_mask.cpp, with parallel_for.hpp under the
 // one GCD call) and its two kernels exist as spk_mask_reduce/spk_mask_epilogue
-// in src/shaders/vulkan. What remains refused is the Cineon DI (its
-// spk_di_encode kernel is unported) and applying the Scene Latitude mapping
-// (only its analysis runs; spk_scene_latitude itself works).
+// in src/shaders/vulkan.
+// [DEYVA r45] The Cineon DI has left it too: spk_di_encode is now in
+// src/shaders/vulkan (translated from nodes.metal) and registered in the
+// Vulkan kernel table, so `digital_intermediate` is a real effect here. Before
+// this the delta was refused outright, which is why turning it on looked like
+// "the preview freezes": the session kept its old params and every later paper
+// change was rejected the same way.
+// What remains refused is applying the Scene Latitude mapping (only its
+// analysis runs; spk_scene_latitude itself works).
 #pragma once
 #include "params.hpp"
 
 namespace spk {
 
-inline const char* windows_unported_error(bool di, bool latitude) {
-    if (di) return "digital intermediate is not implemented by the Windows Vulkan backend yet";
+inline const char* windows_unported_error(bool /*di*/, bool latitude) {
     if (latitude) return "scene latitude mapping is not implemented by the Windows Vulkan backend yet";
     return nullptr;
 }

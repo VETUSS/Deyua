@@ -24,6 +24,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -32,6 +33,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.security.MessageDigest
 
 /**
@@ -166,6 +170,11 @@ fun AboutSheet(ctx: Context, onDismiss: () -> Unit) {
         runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull() ?: ""
     }
     var notice by remember { mutableStateOf<Pair<String, String>?>(null) }
+    // 检查更新：一行状态。查询走 IO，回来后要么交给浏览器，要么把原因留在这行。
+    val scope = rememberCoroutineScope()
+    var checking by remember { mutableStateOf(false) }
+    var updLine by remember { mutableStateOf("") }
+    var updFail by remember { mutableStateOf(false) }
 
     Box(
         Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f))
@@ -205,6 +214,53 @@ fun AboutSheet(ctx: Context, onDismiss: () -> Unit) {
 
             Spacer(Modifier.height(8.dp))
             Hairline(alpha = 0.06f)
+            ActionRow(if (checking) "正在检查更新…" else "检查更新") {
+                if (checking) return@ActionRow
+                checking = true
+                updLine = ""
+                updFail = false
+                scope.launch {
+                    val r = withContext(Dispatchers.IO) {
+                        UpdateCheck.check(version.ifBlank { "0" })
+                    }
+                    checking = false
+                    when (r) {
+                        is UpdateCheck.Result.Newer -> {
+                            val rel = r.release
+                            // 有安装包就去安装包，没有就退到发布页 —— 两种都是浏览器能接的 http(s)。
+                            val url = rel.apkUrl ?: rel.pageUrl
+                            val size = UpdateCheck.sizeText(rel.sizeBytes)
+                            if (url.isBlank()) {
+                                updLine = "该版本未提供下载地址"; updFail = true
+                            } else if (UpdateCheck.open(ctx, url)) {
+                                updLine = "已在浏览器中打开 ${rel.tag}${if (size.isBlank()) "" else "（$size）"}"
+                                updFail = false
+                            } else {
+                                updLine = "没有可用的浏览器，请手动访问 ${rel.pageUrl}"; updFail = true
+                            }
+                        }
+                        is UpdateCheck.Result.Latest -> {
+                            val tag = r.release?.tag.orEmpty()
+                            updLine = if (tag.isBlank()) "当前已是最新版本" else "当前已是最新版本（$tag）"
+                            updFail = false
+                        }
+                        is UpdateCheck.Result.Failed -> {
+                            updLine = "检查失败：${r.reason}"; updFail = true
+                        }
+                    }
+                }
+            }
+            if (updLine.isNotBlank()) {
+                Text(
+                    updLine,
+                    color = if (updFail) Dv.red else Dv.label3,
+                    fontSize = 10.5f.sp, lineHeight = 15.sp,
+                    modifier = Modifier.padding(start = 18.dp, end = 18.dp, bottom = 4.dp),
+                )
+            }
+            ActionRow("打开发布页") {
+                UpdateCheck.open(ctx, UpdateCheck.RELEASES_PAGE)
+            }
             ActionRow("许可证全文 · GPL-3.0") {
                 notice = "GNU General Public License v3.0" to readNotice(ctx, "GPL-3.0.txt")
             }

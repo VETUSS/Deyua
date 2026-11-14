@@ -144,11 +144,20 @@ fun <T> livelySpec(reduce: Boolean): AnimationSpec<T> =
  * 混在真图标里一眼就"不是系统画的"。这里用 Canvas 按 24dp 网格画三枚，线宽统一 1.7dp、
  * 圆角端点，和系统 SF Symbols 的观感一致（也方便以后换色/换尺寸）。
  */
-enum class Glyph { Undo, More, Copy, Plus, Grid, Pulse, Close, Document }
+enum class Glyph {
+    Undo, More, Copy, Plus, Grid, Pulse, Close, Document,
+    // [r50] 已导出胶片列表 / 取景器 / 观片台 / 播放 / 视频 / 动态照片 / 展开箭头
+    Roll, Frame, Lamp, Play, Video, Live, Chevron,
+}
 
 @Composable
-fun GlyphIcon(glyph: Glyph, tint: Color = Color.White, box: androidx.compose.ui.unit.Dp = 22.dp) {
-    androidx.compose.foundation.Canvas(Modifier.size(box)) {
+fun GlyphIcon(
+    glyph: Glyph, tint: Color = Color.White, box: androidx.compose.ui.unit.Dp = 22.dp,
+    rotation: Float = 0f,
+) {
+    androidx.compose.foundation.Canvas(
+        Modifier.size(box).graphicsLayer { rotationZ = rotation }
+    ) {
         val s = size.minDimension
         val stroke = s * 0.077f
         val c = center
@@ -282,6 +291,93 @@ fun GlyphIcon(glyph: Glyph, tint: Color = Color.White, box: androidx.compose.ui.
                 }
                 drawPath(p, tint, style = Stroke(width = stroke * 0.95f,
                     cap = StrokeCap.Round, join = StrokeJoin.Round))
+            }
+            // [r50] 已导出胶片：一条 35mm 片条（两侧齿孔），比"抽屉"更像这个软件的东西
+            Glyph.Roll -> {
+                val w = s * 0.46f
+                val h = s * 0.62f
+                val l = c.x - w / 2f
+                val tp = c.y - h / 2f
+                drawRoundRect(
+                    color = tint, topLeft = Offset(l, tp), size = Size(w, h),
+                    cornerRadius = CornerRadius(s * 0.05f),
+                    style = Stroke(width = stroke * 0.95f),
+                )
+                val hw = w * 0.15f
+                val hh = h * 0.075f
+                for (i in 0 until 3) {
+                    val yy = tp + h * (0.14f + i * 0.28f)
+                    drawRoundRect(color = tint, topLeft = Offset(l - hw * 0.55f, yy), size = Size(hw, hh),
+                        cornerRadius = CornerRadius(hh * 0.3f), style = Stroke(width = stroke * 0.7f))
+                    drawRoundRect(color = tint, topLeft = Offset(l + w - hw * 0.45f, yy), size = Size(hw, hh),
+                        cornerRadius = CornerRadius(hh * 0.3f), style = Stroke(width = stroke * 0.7f))
+                }
+            }
+            // [r50] 取景器：四角括号 + 中心点
+            Glyph.Frame -> {
+                val e = s * 0.29f
+                val arm = s * 0.16f
+                listOf(
+                    Triple(-1f, -1f, 0), Triple(1f, -1f, 1), Triple(-1f, 1f, 2), Triple(1f, 1f, 3)
+                ).forEach { (sx, sy, _) ->
+                    val x = c.x + sx * e
+                    val y = c.y + sy * e
+                    drawLine(tint, Offset(x, y), Offset(x - sx * arm, y), strokeWidth = stroke, cap = StrokeCap.Round)
+                    drawLine(tint, Offset(x, y), Offset(x, y - sy * arm), strokeWidth = stroke, cap = StrokeCap.Round)
+                }
+                drawCircle(tint, radius = s * 0.045f, center = c)
+            }
+            // [r50] 观片台：一枚灯箱（圆 + 上下两道光）
+            Glyph.Lamp -> {
+                drawCircle(tint, radius = s * 0.20f, center = Offset(c.x, c.y + s * 0.04f),
+                    style = Stroke(width = stroke * 0.95f))
+                drawLine(tint, Offset(c.x - s * 0.30f, c.y + s * 0.30f), Offset(c.x + s * 0.30f, c.y + s * 0.30f),
+                    strokeWidth = stroke * 0.9f, cap = StrokeCap.Round)
+                for (k in -1..1) {
+                    val a = Math.toRadians((-90 + k * 25).toDouble())
+                    val r0 = s * 0.28f
+                    val r1 = s * 0.39f
+                    drawLine(tint,
+                        Offset(c.x + (r0 * kotlin.math.cos(a)).toFloat(), c.y - s * 0.02f + (r0 * kotlin.math.sin(a)).toFloat()),
+                        Offset(c.x + (r1 * kotlin.math.cos(a)).toFloat(), c.y - s * 0.02f + (r1 * kotlin.math.sin(a)).toFloat()),
+                        strokeWidth = stroke * 0.85f, cap = StrokeCap.Round)
+                }
+            }
+            Glyph.Play -> {
+                val r = s * 0.30f
+                drawPath(Path().apply {
+                    moveTo(c.x - r * 0.62f, c.y - r)
+                    lineTo(c.x + r, c.y)
+                    lineTo(c.x - r * 0.62f, c.y + r)
+                    close()
+                }, tint, style = Stroke(width = stroke * 0.95f, join = StrokeJoin.Round))
+            }
+            Glyph.Video -> {
+                val w = s * 0.62f
+                val h = s * 0.46f
+                drawRoundRect(color = tint, topLeft = Offset(c.x - w / 2f, c.y - h / 2f), size = Size(w, h),
+                    cornerRadius = CornerRadius(s * 0.07f), style = Stroke(width = stroke * 0.95f))
+                val r = s * 0.09f
+                drawPath(Path().apply {
+                    moveTo(c.x - r * 0.5f, c.y - r)
+                    lineTo(c.x + r * 0.85f, c.y)
+                    lineTo(c.x - r * 0.5f, c.y + r)
+                    close()
+                }, tint, style = Stroke(width = stroke * 0.8f, join = StrokeJoin.Round))
+            }
+            Glyph.Live -> {
+                drawCircle(tint, radius = s * 0.30f, center = c, style = Stroke(width = stroke * 0.9f))
+                drawCircle(tint, radius = s * 0.17f, center = c, style = Stroke(width = stroke * 0.9f))
+                drawCircle(tint, radius = s * 0.055f, center = c)
+            }
+            Glyph.Chevron -> {
+                val w = s * 0.14f
+                val h = s * 0.22f
+                drawPath(Path().apply {
+                    moveTo(c.x - w * 0.4f, c.y - h)
+                    lineTo(c.x + w * 0.6f, c.y)
+                    lineTo(c.x - w * 0.4f, c.y + h)
+                }, tint, style = Stroke(width = stroke, cap = StrokeCap.Round, join = StrokeJoin.Round))
             }
         }
     }

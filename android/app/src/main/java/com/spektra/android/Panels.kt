@@ -56,6 +56,7 @@ fun FilmPaperTab(
     filmVariant: String, onFilmVariant: (String) -> Unit,
     printVariant: String, onPrintVariant: (String) -> Unit,
     scanFilm: Boolean, onScanFilm: (Boolean) -> Unit,
+    diActive: Boolean, onDi: (Boolean) -> Unit,
     exposureEv: Float, onEvChange: (Float) -> Unit, onEvCommit: () -> Unit,
     filmTrueColor: Boolean, onFilmTrueColor: (Boolean) -> Unit,
     reduceMotion: Boolean,
@@ -66,6 +67,19 @@ fun FilmPaperTab(
     val activeVariant = if (section == 0) filmVariant else printVariant
     val variants = if (series == "全部") groups.flatMap { it.variants }
                    else groups.firstOrNull { it.name == series }?.variants ?: emptyList()
+
+    // [r49.2] 网格到底有没有图可画：一行日志说清「几格 / 缓存几张 / 缺几格」。
+    // 用户报"小预览没有了"时，这一行能立刻分出是**没渲出来**还是**没画上去** ——
+    // 前者看 thumb 日志，后者看这里（缓存有、缺口 0，却还是空格子 = 绘制层的问题）。
+    LaunchedEffect(section, variants.size, thumbCache.size) {
+        if (variants.isEmpty()) return@LaunchedEffect
+        val miss = variants.count {
+            val k = if (section == 0) "${it.id}@$printVariant" else "$filmVariant@${it.id}"
+            thumbCache[k] == null
+        }
+        Diagnostics.log("thumb", "网格 section=$section ${variants.size} 格 · 缓存 ${thumbCache.size} 张 · 缺 $miss" +
+            if (miss > 0) "（例：${variants.firstOrNull { thumbCache[if (section == 0) "${it.id}@$printVariant" else "$filmVariant@${it.id}"] == null }?.id}）" else "")
+    }
 
     Column(Modifier.fillMaxWidth().fillMaxHeight().padding(horizontal = 12.dp)) {
         UnderlineTabs(
@@ -140,6 +154,8 @@ fun FilmPaperTab(
                             Box(Modifier.fillMaxWidth().aspectRatio(1.15f)
                                 .clip(RoundedCornerShape(8.dp))
                                 .border(borderW, borderC, RoundedCornerShape(8.dp))) {
+                                // 只有缩略图这一条路（r49.2 删掉了那条永远为 null 的
+                                // 「实拍小样」支路，它的 128 px 请求会被引擎范围校验拒掉）
                                 FilmThumb(
                                     cache = thumbCache,
                                     id = if (section == 0) "${v.id}@$printVariant" else "$filmVariant@${v.id}",
@@ -166,17 +182,38 @@ fun FilmPaperTab(
             }
         }
 
-        // 直扫底片（No Print Profile）：只在相纸页出现，点任一相纸即关闭（上游同规则）
+        // 直扫底片（No Print Profile）与数字中间片（Digital Intermediate）：
+        // [r48] 两块并排的"选项牌"，开关挪到整块的最右边、和两行字垂直居中。
+        //
+        // 之前是"标题 + 紧跟一个 46×28 开关，下面再挂一行小字"：开关正好卡在这两行
+        // 文字的右上方，看着像是塞进字里；标题一长（"数字中间片"）就把它挤到边上，
+        // 窄屏直接撞在一起。现在改成：整块可点、左边一列字、右边一个开关，文字带
+        // weight + 省略号 —— 无论多长都不会和开关重叠；开着的时候整块染琥珀色底，
+        // 一眼能看出这两级"跳过"是同一类东西。
         if (section == 1) {
-            Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 0.dp, top = 2.dp, bottom = 2.dp)
-                .height(40.dp),
-                verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("直扫底片", color = Dv.label1, fontSize = 12.sp, letterSpacing = 0.4.sp)
-                    Text(if (scanFilm) "正在看底片本身 · 点任一相纸即关闭" else "跳过相纸，直接看冲好的底片",
-                        color = if (scanFilm) Dv.accent else Dv.label3, fontSize = 9.5f.sp)
-                }
-                DvToggle(checked = scanFilm, onChange = onScanFilm, desc = "直扫底片")
+            Row(
+                Modifier.fillMaxWidth().padding(start = 2.dp, end = 0.dp, top = 2.dp, bottom = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                // —— 左：直扫底片 ——
+                PrintOptionTile(
+                    title = "直扫底片",
+                    sub = if (scanFilm) "看底片本身 · 点相纸即关" else "跳过相纸",
+                    on = scanFilm,
+                    modifier = Modifier.weight(1f),
+                ) { onScanFilm(!scanFilm) }
+                // —— 右：数字中间片 ——
+                val diOn = diActive && !scanFilm
+                PrintOptionTile(
+                    title = "数字中间片",
+                    sub = when {
+                        scanFilm -> "打开会先关掉直扫"
+                        diActive -> "平扫 · 相纸不影响"
+                        else -> "跳过印相 · 平淡中性"
+                    },
+                    on = diOn,
+                    modifier = Modifier.weight(1f),
+                ) { onDi(!diOn) }
             }
         }
 
@@ -189,6 +226,56 @@ fun FilmPaperTab(
                 default = 0f,
             )
         }
+    }
+}
+
+/**
+ * 「跳过印相 / 跳过相纸」这类二级能力的选项牌（r48）。
+ *
+ * 一整块都可点，左边两行字、右边一个开关。开关不再挤在标题右边、也不再和下面
+ * 那行说明抢位置 —— 文字那列带 weight，再长的名字也只会自己省略，不会压到开关上。
+ * 开启时整块染一层琥珀并描一圈细边，"这两级是同一类东西"由视觉直接说清楚。
+ */
+@Composable
+private fun PrintOptionTile(
+    title: String,
+    sub: String,
+    on: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val bg by animateColorAsState(
+        if (on) Dv.accent.copy(alpha = 0.13f) else Color.White.copy(alpha = 0.035f),
+        tween(160), label = "tileBg",
+    )
+    val edge = if (on) Dv.accent.copy(alpha = 0.45f) else Color.White.copy(alpha = 0.06f)
+    Row(
+        modifier.height(48.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(bg)
+            .border(1.dp, edge, RoundedCornerShape(12.dp))
+            .iosTap(pressDim = 0.86f, haptic = true, onClick = onClick)
+            .padding(start = 10.dp, end = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                title,
+                color = if (on) Dv.accent else Dv.label1,
+                fontSize = 11.5.sp, letterSpacing = 0.3.sp,
+                fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(1.dp))
+            Text(
+                sub,
+                color = if (on) Dv.accent.copy(alpha = 0.8f) else Dv.label3,
+                fontSize = 8.5.sp, lineHeight = 11.sp,
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Spacer(Modifier.width(6.dp))
+        DvToggle(checked = on, onChange = { onClick() }, desc = title)
     }
 }
 
@@ -256,8 +343,22 @@ fun FormatTab(
     // [r38] 负片反差（引擎的 density_curve_gamma）。属 SHOOT 层，改一次要重冲负片，
     // 所以和「胶片曝光」一样：拖动只改数值，松手才真渲。
     densityGamma: Float, onDensityGamma: (Float) -> Unit, onDensityGammaCommit: () -> Unit,
+    // [r43] 解码曲线（场景侧）
+    sceneCurve: SceneCurve.Cfg, onSceneCurve: (SceneCurve.Cfg) -> Unit,
+    sceneApplied: Boolean,
+    /** RAW 的像素在 native 会话里，Java 侧拿不到 → 这条曲线对 RAW 不生效，UI 要如实禁用 */
+    sceneSupported: Boolean,
+    /** 松手就重算（r49.3）：滑杆的 onValueChangeFinished 调它，不用再去点「应用」 */
+    onSceneCommit: () -> Unit,
+    onApplySceneCurve: () -> Unit,
+    // [r43] 叠片：双重曝光 / 半格组
+    pairActive: Boolean, compositeBusy: Boolean,
+    onDoubleExposure: () -> Unit, onHalfFramePair: () -> Unit, onPairOff: () -> Unit,
+    canUndoComposite: Boolean, onUndoComposite: () -> Unit,
     overscanActive: Boolean, onOverscanActive: (Boolean) -> Unit,
     overscanFormat: String, onOverscanFormat: (String) -> Unit,
+    /** 打开取景页：片门固定，画面可拖动/缩放（写回 geometry_crop 的中心与倍率） */
+    onOpenFrame: () -> Unit,
     overscanFog: Float, onOverscanFog: (Float) -> Unit, onOverscanFogCommit: () -> Unit,
     overscanLeaks: Float, onOverscanLeaks: (Float) -> Unit, onOverscanLeaksCommit: () -> Unit,
     overscanGate: String, onOverscanGate: (String) -> Unit,
@@ -353,6 +454,123 @@ fun FormatTab(
             }
         }
 
+        // ================= 6 · 解码曲线 =================
+        Section("解码曲线", "decode", 6, 6 in open, ::toggle,
+            trailing = {
+                if (!sceneCurve.isIdentity) {
+                    Label(if (sceneApplied) "已应用" else "待应用",
+                        color = if (sceneApplied) Dv.accent else Orange, size = 9)
+                }
+            }) {
+            Text(
+                "作用在胶片看到光之前：压高光，胶片就少曝一点；提阴影，暗部不必靠相纸硬拉。" +
+                    "滑杆松手即按原片重算，不用再点「应用」。",
+                color = Dv.label3, fontSize = 10.sp, lineHeight = 14.sp,
+                modifier = Modifier.padding(bottom = 2.dp)
+            )
+            // [r49.3] 「拖了没反应」的另一半原因：主图默认开着自动曝光，它会把整体
+            // 亮度重新配平到中灰。于是「场景曝光」表现为胶片吃到的光量变了（高光余量、
+            // 颗粒、光晕跟着变），画面中灰却还是那个中灰 —— 看着就像滑杆没用。
+            // 这一句必须写在这里，否则用户永远以为是功能坏了。
+            if (!sceneSupported) {
+                // RAW 走引擎 LibRaw 解码，像素从头到尾没进过 Java 堆，这条曲线在
+                // 宿主侧无从下手。以前这里照样给三个能拖的滑杆，拖完点「应用」也只是
+                // 把整张图重新导入一遍 —— 用户看到的就是「解码曲线完全没有效果」。
+                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                    .background(Orange.copy(alpha = 0.08f))
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Text("RAW 的像素在引擎里，这条曲线暂不适用；导入 JPEG / PNG 等栅格照片后可用。",
+                        color = Dv.orangeLight, fontSize = 10.sp, lineHeight = 14.sp)
+                }
+            } else {
+            Text(
+                "注意：主图开着自动曝光，整体亮度会被它重新配平到中灰。所以「场景曝光」" +
+                    "主要改变胶片吃到多少光（高光余量与颗粒跟着变），画面不会整体变亮变暗；" +
+                    "「阴影 / 高光」改的是影调形状，不受配平影响。",
+                color = Dv.label4, fontSize = 9.5f.sp, lineHeight = 13.sp,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
+            ParamBlock("场景曝光", "%+.1f EV".format(sceneCurve.ev), note = "−3…+3") {
+                TickerSlider(
+                    value = sceneCurve.ev,
+                    onValueChange = { onSceneCurve(sceneCurve.copy(ev = it)) },
+                    onValueChangeFinished = onSceneCommit,
+                    valueRange = -3f..3f, snapStep = 0.1f, majorStep = 1f,
+                    reduceMotion = reduceMotion, default = 0f)
+            }
+            ParamBlock("阴影", "%.2f".format(sceneCurve.shadow), note = "0–1") {
+                TickerSlider(
+                    value = sceneCurve.shadow,
+                    onValueChange = { onSceneCurve(sceneCurve.copy(shadow = it)) },
+                    onValueChangeFinished = onSceneCommit,
+                    valueRange = 0f..1f, snapStep = 0.05f, majorStep = 0.5f,
+                    reduceMotion = reduceMotion, default = 0f)
+            }
+            ParamBlock("高光", "%.2f".format(sceneCurve.highlight), note = "0–1") {
+                TickerSlider(
+                    value = sceneCurve.highlight,
+                    onValueChange = { onSceneCurve(sceneCurve.copy(highlight = it)) },
+                    onValueChangeFinished = onSceneCommit,
+                    valueRange = 0f..1f, snapStep = 0.05f, majorStep = 0.5f,
+                    reduceMotion = reduceMotion, default = 0f)
+            }
+            Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    when {
+                        sceneCurve.isIdentity -> "与原片一致"
+                        sceneApplied -> "已按此曲线重算"
+                        else -> "松手即生效；若没变，点右侧重算"
+                    },
+                    color = if (sceneApplied) Dv.label3 else Orange, fontSize = 9.5f.sp,
+                    modifier = Modifier.weight(1f)
+                )
+                // 松手已经自动重算，这个按钮是"手动再跑一遍"的兜底（例如上次重算失败）
+                Box(
+                    Modifier.clip(RoundedCornerShape(9.dp))
+                        .background(Dv.accent.copy(alpha = 0.16f))
+                        .iosTap(pressDim = 0.7f, haptic = true) { onApplySceneCurve() }
+                        .padding(horizontal = 12.dp, vertical = 7.dp)
+                ) {
+                    Text("重算", color = Dv.accent, fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+            }   // sceneSupported
+        }
+
+        // ================= 3 · 叠片 =================
+        Section("叠片", "composite", 3, 3 in open, ::toggle,
+            trailing = { if (pairActive) Label("半格组", color = Orange, size = 9) }) {
+            Text(
+                "两张画面放进同一格底片：双曝是两次曝光的光相加，半格组是同一格里并排两格 18×24",
+                color = Dv.label3, fontSize = 10.sp, lineHeight = 14.sp,
+                modifier = Modifier.padding(bottom = 6.dp)
+            )
+            CompositeRow("双重曝光", "第二张的光叠在现在这张上", "选择第二张", compositeBusy, onDoubleExposure)
+            CompositeRow("半格组", "左右两格，共用这支胶片与相纸", if (pairActive) "重选第二张" else "选择第二张",
+                compositeBusy, onHalfFramePair)
+            if (pairActive) {
+                Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("半格组开启中 · 片幅已锁 135 半格", color = Dv.accent, fontSize = 10.sp,
+                        modifier = Modifier.weight(1f))
+                    Text("退出", color = Dv.label2, fontSize = 10.5f.sp,
+                        modifier = Modifier.clip(RoundedCornerShape(8.dp))
+                            .iosTap(pressDim = 0.6f, haptic = true) { onPairOff() }
+                            .padding(horizontal = 10.dp, vertical = 5.dp))
+                }
+            }
+            if (canUndoComposite) {
+                Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("想回到叠片之前那张？", color = Dv.label3, fontSize = 10.sp,
+                        modifier = Modifier.weight(1f))
+                    Text("撤销叠片", color = Dv.label2, fontSize = 10.5f.sp,
+                        modifier = Modifier.clip(RoundedCornerShape(8.dp))
+                            .iosTap(pressDim = 0.6f, haptic = true) { onUndoComposite() }
+                            .padding(horizontal = 10.dp, vertical = 5.dp))
+                }
+            }
+        }
+
         // ================= 2 · 片边 =================
         Section("片边", "overscan", 2, 2 in open, ::toggle,
             trailing = { DvToggle(overscanActive, onOverscanActive, desc = "片边") }) {
@@ -362,7 +580,7 @@ fun FormatTab(
                     modifier = Modifier.padding(vertical = 4.dp))
             } else {
                 val osFormats = listOf(
-                    "135", "135 Half", "135 宽幅",
+                    "135", "135 Half", "135 宽幅", "110 13×17", "APS 16.7×30",
                     "120 6×4.5", "120 6×6", "120 6×7", "120 6×8", "120 6×9", "120 6×12", "120 6×17",
                 )
                 ParamRow("片幅", osFormats.firstOrNull { osFormatKey(it) == overscanFormat } ?: overscanFormat)
@@ -370,6 +588,25 @@ fun FormatTab(
                     osFormats.forEach { f ->
                         DvChip(f, overscanFormat == osFormatKey(f), { onOverscanFormat(osFormatKey(f)) }, size = 11)
                     }
+                }
+                // 取景：门幅决定形状，位置和放大由用户定。以前只能居中裁，
+                // 想让人靠左一点、地平线压低一点都没有入口
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        Modifier.height(32.dp).clip(RoundedCornerShape(9.dp))
+                            .background(Orange.copy(alpha = 0.18f))
+                            .iosTap(pressDim = 0.7f, haptic = true) { onOpenFrame() }
+                            .padding(horizontal = 13.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text("调整取景", color = Orange, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    Spacer(Modifier.width(9.dp))
+                    Text(
+                        "拖动画面 · 双指缩放 · 片门不动",
+                        color = Dv.label3, fontSize = 9.5f.sp
+                    )
                 }
                 Spacer(Modifier.height(8.dp))
                 ParamBlock("片边雾", "%.1f".format(overscanFog), note = "edge fog") {
@@ -437,7 +674,7 @@ fun FormatTab(
         }
 
         // ================= 3 · 日期后背 =================
-        Section("日期后背", "date back", 3, 3 in open, ::toggle,
+        Section("日期后背", "date back", 4, 4 in open, ::toggle,
             trailing = { DvToggle(dateBack.active, { applyDate(dateBack.copy(active = it)) }, desc = "日期后背") }) {
             if (!dateBack.active) {
                 Text("相机在底片上烧的日期。可印在画面角落，也可印在齿孔之间（需片边）",
@@ -505,7 +742,7 @@ fun FormatTab(
         // ================= 4 · 暗房 =================
         // 引擎的 print_exposure 是「少曝光更亮」，这里换算成摄影习惯的「档」，往右更亮。
         val brightStops = (-Math.log(darkroom.exposure.toDouble()) / Math.log(2.0)).toFloat()
-        Section("暗房", "enlarger", 4, 4 in open, ::toggle,
+        Section("暗房", "enlarger", 5, 5 in open, ::toggle,
             trailing = { Label("%+.1f 档".format(brightStops), color = Dv.label3, size = 9) }) {
             Text("同一张底片换相纸、拨滤色片 —— 真实暗房里颜色就是这样变的",
                 color = Dv.label3, fontSize = 10.5f.sp, lineHeight = 15.sp,
@@ -618,7 +855,7 @@ fun FormatTab(
         }
 
         // ================= 5 · 胶片细节 =================
-        Section("胶片细节", "couplers", 5, 5 in open, ::toggle,
+        Section("胶片细节", "couplers", 7, 7 in open, ::toggle,
             trailing = { Label("%.2f×".format(darkroom.glare), color = Dv.label3, size = 9) }) {
             // ===== [r38] 负片反差（density_curve_gamma）=====
             //
@@ -678,7 +915,7 @@ fun FormatTab(
         }
 
         // ================= 6 · 相机 =================
-        Section("相机", "camera", 6, 6 in open, ::toggle,
+        Section("相机", "camera", 8, 8 in open, ::toggle,
             trailing = { Label(CAMERA_FILTERS.firstOrNull { it.first == camera.filter }?.second ?: "无",
                 color = Dv.label3, size = 9) }) {
             ParamRow("镜头滤色片", "")
@@ -752,5 +989,35 @@ private fun SwitchRow(title: String, checked: Boolean, onChange: (Boolean) -> Un
             if (note != null) Text(note, color = Dv.label3, fontSize = 9.5f.sp)
         }
         DvToggle(checked, onChange, desc = title)
+    }
+}
+
+
+/** 叠片区的一行：左边标题 + 说明，右边一个按钮。 */
+@Composable
+private fun CompositeRow(
+    title: String,
+    desc: String,
+    action: String,
+    busy: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = Dv.label1, fontSize = 12.5f.sp, letterSpacing = 0.3.sp)
+            Text(desc, color = Dv.label3, fontSize = 9.5f.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Box(
+            Modifier.clip(RoundedCornerShape(9.dp))
+                .background(if (busy) Dv.accentDim else Dv.accent.copy(alpha = 0.16f))
+                .iosTap(pressDim = 0.7f, haptic = true) { if (!busy) onClick() }
+                .padding(horizontal = 12.dp, vertical = 7.dp)
+        ) {
+            Text(if (busy) "处理中…" else action,
+                color = if (busy) Dv.label2 else Dv.accent, fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold)
+        }
     }
 }

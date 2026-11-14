@@ -1862,7 +1862,24 @@ bool Pipeline::film_prefix(const Image& in, const FrameShape& frame, Image& cur,
         // RFC-032 §27: with overscan on, the frame *is* the format's gate, so
         // its long edge in millimetres is the format's, not `film_format_mm`.
         const double long_mm = overscan_wanted() ? overscan_gate_long_mm() : params_.camera.film_format_mm;
-        pixel_size_um_ = long_mm * 1000.0 / double(source_long_edge_);
+        // [Deyva r42.3] `source_long_edge_` is the *pre-crop* long edge, which
+        // is only the frame's when the crop window covers the whole long side.
+        // Two cases break that and both were shipping broken canvases:
+        //   · the crop squares the picture off (4:3 source, 6x6 gate): the
+        //     frame's long edge shrinks by ch, and the gate came out at 42 mm
+        //     instead of 56;
+        //   · the viewfinder pushes in (crop_w/h = base / zoom): the frame's
+        //     physical size fell by the zoom factor, while the base is still
+        //     laid out in real millimetres (135 = 35 mm, 120 = 61 mm). At
+        //     zoom 2 a 6x6 canvas became 24 x 61 mm -- a narrow strip, the
+        //     base's perforations and edge print squeezed into vertical bars.
+        // The millimetres are the gate's, so the pixel count must be this
+        // frame's, not the source's. `cur` here is a full plane (prefix nodes
+        // never see a band), so its size *is* the frame's.
+        uint32_t pitch_edge = source_long_edge_;
+        if (overscan_wanted() && cur.w > 0 && cur.h > 0)
+            pitch_edge = cur.w > cur.h ? cur.w : cur.h;
+        pixel_size_um_ = long_mm * 1000.0 / double(pitch_edge);
     }
 
     // The film side's one seed for this run (RFC-020 §4.3, trap 4), drawn here

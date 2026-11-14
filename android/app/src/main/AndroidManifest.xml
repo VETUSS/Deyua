@@ -6,6 +6,8 @@
         android:maxSdkVersion="28" />
     <!-- 刻度条跨刻度触觉震动（无此权限 vibrate() 会抛 SecurityException 闪退） -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- 检查更新：只读 GitHub Release 的 JSON，下载交给系统浏览器 -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:allowBackup="true"
@@ -19,10 +21,25 @@
             android:name=".MainActivity"
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden|colorMode"
-            android:windowSoftInputMode="adjustResize">
+            android:windowSoftInputMode="adjustResize"
+            android:launchMode="singleTask">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- [r48] 出现在系统分享面板：相册里选一张照片 → 分享 → Deyva，
+                 省掉"打开 app、导入、在系统相册里再找一遍"。
+                 singleTask 保证不会因为反复分享而在同一个任务里堆出好几个实例
+                 （每个实例都带一份引擎），第二次分享走 onNewIntent。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
             </intent-filter>
         </activity>
         <!-- 供"导出并共享"临时文件分享 -->

@@ -88,6 +88,12 @@ constexpr KernelSpec kKernels[] = {
     {"spk_geometry_resample_df", 4, kWorkgroup},
     {"spk_lut3d_trilinear", 6, kWorkgroup},
     {"spk_di_normalise", 5, kWorkgroup},
+    // [DEYVA r43.1] RFC-028's Digital Intermediate encode, translated from
+    // nodes.metal. Without it the DI node had no kernel on Android: dispatch
+    // failed, the whole frame came back null and the app sat on "冲洗中".
+    // Binds 4: the log10 positive, the 42-float parameter block, the pixel
+    // count, the output.
+    {"spk_di_encode", 4, kWorkgroup},
     // Overscan (RFC-032) kernels, ported to Vulkan for the Android build. Each
     // binds 4: image(s), the overscan parameter block, the pixel count, output.
     // spk_overscan_canvas gained a 5th (v0.8.88): the probe-echo buffer the

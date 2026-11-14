@@ -87,8 +87,9 @@ internal object LtHdr {
         bmp.asImageBitmap()
     }.getOrNull()
 
-    /** RGBA_F16 每像素 64 位：R 在低 16 位，A 在最高 16 位。 */
-    private fun pack(r: Float, g: Float, b: Float): Long =
+    /** RGBA_F16 每像素 64 位：R 在低 16 位，A 在最高 16 位。
+     *  internal：预览的真 HDR 位图（UltraHdrJpeg.hdrLookHdr）也走这一份打包。 */
+    internal fun pack(r: Float, g: Float, b: Float): Long =
         (0x3C00L shl 48) or
             (half(b).toLong() shl 32) or
             (half(g).toLong() shl 16) or

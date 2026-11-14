@@ -341,8 +341,9 @@ struct spk_engine {
         // [DEYVA r34] `contrast_mask` is no longer one of them: RFC-024's
         // host half and its two kernels are in this build (see
         // windows_unported.hpp), so the mask is a real, working effect.
+        // [DEYVA r45] Nor is `digital_intermediate`: spk_di_encode is ported.
         Json unported = Json::array();
-        for (const char* feature : {"digital_intermediate", "scene_latitude_mapping"})
+        for (const char* feature : {"scene_latitude_mapping"})
             unported.push(Json(std::string(feature)));
         backend.set("unsupported_features", std::move(unported));
 #endif
@@ -1724,11 +1725,10 @@ spk_status spk_render_digital_intermediate(spk_session* session, spk_result* out
     std::lock_guard<std::mutex> guard(session->lock);
     g_error.clear();
     std::memset(out, 0, sizeof *out);
-#ifndef __APPLE__
+    // [DEYVA r45] This used to bail out on every non-Apple build because
+    // spk_di_encode had no Vulkan port. It does now, so the export path below
+    // is live here too.
     if (out_json) *out_json = nullptr;
-    g_error = windows_unported_error(true, false);
-    return SPK_ERR_USER;
-#endif
     if (session->params.film.info.is_positive()) {
         g_error = "a slide film has no orange mask and no negative to reverse, so it has no "
                   "Digital Intermediate";

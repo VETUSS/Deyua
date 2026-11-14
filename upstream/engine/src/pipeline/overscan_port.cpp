@@ -108,28 +108,43 @@ struct Format {
     double along;           // the gate's nominal size along the film, mm (the format's long edge when > across)
     bool perforated;
     const char* families;   // gate families its real cameras have (RFC-032 §29), for gate = auto
+    // Perforation geometry, millimetres. 135 is the reference (pitch 4.75, hole
+    // 1.98 x 2.80, 2.00 mm from the film edge); 110 carries one larger hole per
+    // frame, and APS has no sprocket holes at all. Kept per format so a new
+    // stock size never inherits 135's sprocket pitch.
+    double perf_pitch, perf_w, perf_h, perf_edge, perf_r;
+    // Rebate along the film on each side of the gate; 0 = derive from whether
+    // the format is perforated (the 135 / 120 rules below).
+    double margin_along;
 };
 constexpr Format kFormats[] = {
     // 135: 8 perforations a frame. The gate is a camera's, not ISO's 36 x 24:
     // measured on seven strips in reference_film/135 it is 36.0-36.6 by
     // 24.0-24.8 (means 36.25 x 24.3), 0.47-0.67 mm from the perforations
     // (mean 0.55; a 24.0 gate would leave 0.70). Still 3:2 within 0.6 %.
-    {"135",     35.0, 24.3, 36.25, true,  "square"},
-    {"135_half", 35.0, 24.0, 18.0, true, "square"},            // half frame: 18 x 24 on 4 perforations, portrait when held level
-    {"120_645", 61.0, 56.0, 41.5, false, "eared rounded"},     // ISO 732 nominal width; Mamiya spec frame sizes
-    {"120_6x6", 61.0, 56.0, 56.0, false, "kicked square"},
-    {"120_6x7", 61.0, 56.0, 69.5, false, "square"},
-    {"120_6x8", 61.0, 56.0, 76.0, false, "shouldered"},
-    {"120_6x9", 61.0, 56.0, 84.0, false, "square"},
+    {"135",     35.0, 24.3, 36.25, true,  "square", 4.75, 1.98, 2.80, 2.00, 0.50, 0.0},
+    {"135_half", 35.0, 24.0, 18.0, true, "square", 4.75, 1.98, 2.80, 2.00, 0.50, 0.0},  // half frame: 18 x 24 on 4 perforations
+    // 110: 16 mm film, 13 x 17 frame, one sprocket hole per frame on the top
+    // edge (2.4 x 2.0 mm, 17 mm pitch, 1.6 mm in). Cartridge-loaded, so the
+    // hole grid is the frame's own -- there is nothing to lock a phase to.
+    {"110",     16.0, 13.0, 17.0, true,  "rounded", 17.0, 2.40, 2.00, 1.60, 0.60, 0.45},
+    // APS: 24 mm film, 16.7 x 30.2 frame, no sprocket holes; the rebate is the
+    // magnetic coating strip, about 3.6 mm a side.
+    {"aps",     24.0, 16.7, 30.2, false, "rounded", 0.0, 0.0, 0.0, 0.0, 0.0, 3.60},
+    {"120_645", 61.0, 56.0, 41.5, false, "eared rounded", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},  // ISO 732 nominal width; Mamiya spec frame sizes
+    {"120_6x6", 61.0, 56.0, 56.0, false, "kicked square", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    {"120_6x7", 61.0, 56.0, 69.5, false, "square", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    {"120_6x8", 61.0, 56.0, 76.0, false, "shouldered", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    {"120_6x9", 61.0, 56.0, 84.0, false, "square", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
     // The panoramic long formats (answer sheet C1, C5): square gates until an
     // XPan, a GX617 and a Linhof 617 strip are measured. The XPan advances 14
     // perforations (66.5 mm) for its 65 mm gate, counted off the perforations
     // (C8), so the 135 phase and advance error hold.
-    {"135_xpan", 35.0, 24.0, 65.0, true, "square"},
-    {"120_6x12", 61.0, 56.0, 112.0, false, "square"},
-    {"120_6x17", 61.0, 56.0, 168.0, false, "square"},
+    {"135_xpan", 35.0, 24.0, 65.0, true, "square", 4.75, 1.20, 2.80, 2.00, 0.30, 0.0},
+    {"120_6x12", 61.0, 56.0, 112.0, false, "square", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    {"120_6x17", 61.0, 56.0, 168.0, false, "square", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
 };
-constexpr const char* kFormatNames = "135, 135_half, 120_645, 120_6x6, 120_6x7, 120_6x8, 120_6x9, 135_xpan, 120_6x12, 120_6x17";
+constexpr const char* kFormatNames = "135, 135_half, 110, aps, 120_645, 120_6x6, 120_6x7, 120_6x8, 120_6x9, 135_xpan, 120_6x12, 120_6x17";
 constexpr const char* kGateFamilies[] = {"square", "rounded", "eared", "shouldered", "kicked"};
 const Format* find_format(const std::string& name) {
     for (const Format& f : kFormats) if (name == f.name) return &f;
@@ -643,7 +658,11 @@ bool Pipeline::overscan_layout(uint32_t frame_w, uint32_t frame_h, std::string& 
     // the advance error is the frame's; sprocket-locked, so it is small.
     L.perforated = fmt->perforated;
     if (L.perforated) {
-        L.perf_pitch = 4.75; L.perf_w = 1.98; L.perf_h = 2.80; L.perf_edge = 2.00; L.perf_r = 0.50;
+        L.perf_pitch = fmt->perf_pitch > 0.0 ? fmt->perf_pitch : 4.75;
+        L.perf_w = fmt->perf_w > 0.0 ? fmt->perf_w : 1.98;
+        L.perf_h = fmt->perf_h > 0.0 ? fmt->perf_h : 2.80;
+        L.perf_edge = fmt->perf_edge > 0.0 ? fmt->perf_edge : 2.00;
+        L.perf_r = fmt->perf_r;
         // A properly behaved camera (owner, 2026-10-03): the frame sits on the
         // perforation grid so the edge print falls inside it -- on Gold 200 and
         // Portra 800 the full-frame number ends at the frame's right edge
@@ -657,7 +676,8 @@ bool Pipeline::overscan_layout(uint32_t frame_w, uint32_t frame_h, std::string& 
     if (o.mode == "strip") {
         // 135 full frame advances 8 perforations (38 mm) for a 36 mm gate: ~1 mm
         // a side shows. Half frame advances 4 (19 mm) for 18 mm: ~0.5 mm a side.
-        margin_along = fmt->perforated ? (fmt->along < 20.0 ? rc.uni(0.40, 0.50) : rc.uni(0.75, 0.95))
+        margin_along = fmt->margin_along > 0.0 ? fmt->margin_along
+                     : fmt->perforated ? (fmt->along < 20.0 ? rc.uni(0.40, 0.50) : rc.uni(0.75, 0.95))
                                        : rc.uni(1.3, 2.1) + rf.uni(-0.25, 0.25);
         // With a carrier the scan reaches past the film's long edges and shows
         // it there (answer sheet C2): nothing printed on the film can be cut
