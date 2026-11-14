@@ -72,10 +72,16 @@ private fun querySpektraPhotos(ctx: Context, hidden: Set<String> = emptySet()): 
         MediaStore.Images.Media._ID,
         MediaStore.Images.Media.DATE_ADDED
     )
-    val selection = "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
+    // 静态成片在 `Pictures/Deyva`；动态照片改到了 `DCIM/Camera`（相册的动态照片
+    // 索引只挂在这个桶上，见 LiveMovie.saveImage 的注释）。两条都要收，否则导出的
+    // Live 图在本软件相册里会凭空消失。
+    val selection = "(${MediaStore.Images.Media.RELATIVE_PATH} LIKE ? OR " +
+        "(${MediaStore.Images.Media.RELATIVE_PATH} LIKE ? AND " +
+        "${MediaStore.Images.Media.DISPLAY_NAME} LIKE ?))"
     ctx.contentResolver.query(
         MediaStore.Images.Media.EXTERNAL_CONTENT_URI, projection, selection,
-        arrayOf("Pictures/Deyva/%"), "${MediaStore.Images.Media.DATE_ADDED} DESC"
+        arrayOf("Pictures/Deyva/%", "DCIM/Camera/%", "Deyva_Live_%"),
+        "${MediaStore.Images.Media.DATE_ADDED} DESC"
     )?.use { c ->
         val idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
         val dateCol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
