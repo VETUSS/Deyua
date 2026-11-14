@@ -6,8 +6,11 @@
         android:maxSdkVersion="28" />
     <!-- 刻度条跨刻度触觉震动（无此权限 vibrate() 会抛 SecurityException 闪退） -->
     <uses-permission android:name="android.permission.VIBRATE" />
-    <!-- 检查更新：只读 GitHub Release 的 JSON，下载交给系统浏览器 -->
+    <!-- 检查更新：读取 GitHub Release 的 JSON 并下载安装包 -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- [r62] 应用内更新：调起系统包安装器。安装仍需用户在系统设置里
+         为本应用打开"安装未知应用"，这条权限只声明意图，不代表可以静默安装。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:allowBackup="true"

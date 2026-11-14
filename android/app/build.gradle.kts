@@ -14,8 +14,8 @@ android {
         applicationId = "com.spektra.android"
         minSdk = 24
         targetSdk = 34
-        versionCode = 984
-        versionName = "0.8.117-r61"
+        versionCode = 985
+        versionName = "0.8.118-r62"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")

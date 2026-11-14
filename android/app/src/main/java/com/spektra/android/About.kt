@@ -6,11 +6,14 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -21,6 +24,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,6 +40,7 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.security.MessageDigest
 
 /**
@@ -170,11 +175,36 @@ fun AboutSheet(ctx: Context, onDismiss: () -> Unit) {
         runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull() ?: ""
     }
     var notice by remember { mutableStateOf<Pair<String, String>?>(null) }
-    // 检查更新：一行状态。查询走 IO，回来后要么交给浏览器，要么把原因留在这行。
+    // 检查更新 → 应用内下载 → 按发布摘要校验 → 调起系统安装器。
+    // 整个流程只用这一个状态，界面上的标签、说明、进度条都由它导出，不另设几组
+    // 互斥的布尔量（那种写法迟早会同时为真）。
     val scope = rememberCoroutineScope()
-    var checking by remember { mutableStateOf(false) }
-    var updLine by remember { mutableStateOf("") }
-    var updFail by remember { mutableStateOf(false) }
+    var st by remember { mutableStateOf<UpdState>(UpdState.Idle) }
+    var got by remember { mutableStateOf(0L) }
+    var total by remember { mutableStateOf(0L) }
+
+    // 进度回调在 IO 线程上（DownloadManager 的轮询在那边），写状态要回主线程。
+    val push: (Long, Long) -> Unit = { g, t ->
+        Handler(Looper.getMainLooper()).post {
+            got = g
+            total = t
+            st = UpdState.Working(if (t > 0L) (g.toFloat() / t).coerceIn(0f, 1f) else 0f)
+        }
+    }
+
+    // 下载在系统那边进行，与本面板的存亡无关。重新打开时接回去：
+    // 还在跑就继续显示进度，已下完没装就直接给"安装更新"。
+    LaunchedEffect(Unit) {
+        val r = withContext(Dispatchers.IO) { UpdateDownload.resume(ctx, version) } ?: return@LaunchedEffect
+        when (r) {
+            is UpdateDownload.Resume.Ready -> st = UpdState.Ready(r.file, r.tag)
+            is UpdateDownload.Resume.Running -> {
+                st = UpdState.Working(0f)
+                val done = withContext(Dispatchers.IO) { UpdateDownload.await(ctx, r.job) { g, t -> push(g, t) } }
+                st = settle(ctx, done, r.job.tag)
+            }
+        }
+    }
 
     Box(
         Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f))
@@ -207,56 +237,98 @@ fun AboutSheet(ctx: Context, onDismiss: () -> Unit) {
 
             Text(
                 "签名与安装来源用于区分官方构建与二次打包。校验不通过不影响任何功能 —— " +
-                    "Deyva 以 GPL-3.0 分发，你有权运行自己修改的版本。",
+                    "Deyva 以 GPL-3.0 分发，你有权运行自己修改的版本。\n" +
+                    "更新在应用内下载，落盘后按发布页给出的 SHA-256 校验，通过才交给系统安装。",
                 color = Dv.label2, fontSize = 10.5f.sp, lineHeight = 15.sp,
                 modifier = Modifier.padding(horizontal = 18.dp),
             )
 
             Spacer(Modifier.height(8.dp))
             Hairline(alpha = 0.06f)
-            ActionRow(if (checking) "正在检查更新…" else "检查更新") {
-                if (checking) return@ActionRow
-                checking = true
-                updLine = ""
-                updFail = false
-                scope.launch {
-                    val r = withContext(Dispatchers.IO) {
-                        UpdateCheck.check(version.ifBlank { "0" })
+            ActionRow(updLabel(st)) {
+                when (val s = st) {
+                    is UpdState.Found -> {
+                        // 上一轮已经下好、校验过、只是没装成（用户取消了安装器）：直接给安装。
+                        val already = UpdateDownload.cached(ctx, s.rel.tag)
+                        if (already != null) {
+                            st = UpdState.Ready(already, s.rel.tag)
+                            return@ActionRow
+                        }
+                        when (val begin = UpdateDownload.start(ctx, s.rel)) {
+                            is UpdateDownload.Start.Ok -> {
+                                got = 0L
+                                total = s.rel.sizeBytes
+                                st = UpdState.Working(0f)
+                                scope.launch {
+                                    val done = withContext(Dispatchers.IO) {
+                                        UpdateDownload.await(ctx, begin.job) { g, t -> push(g, t) }
+                                    }
+                                    st = settle(ctx, done, begin.job.tag)
+                                }
+                            }
+                            is UpdateDownload.Start.Fail -> st = UpdState.Note(
+                                "无法开始下载：${begin.reason}。可用「打开发布页」在浏览器下载", true
+                            )
+                        }
                     }
-                    checking = false
-                    when (r) {
-                        is UpdateCheck.Result.Newer -> {
-                            val rel = r.release
-                            // 有安装包就去安装包，没有就退到发布页 —— 两种都是浏览器能接的 http(s)。
-                            val url = rel.apkUrl ?: rel.pageUrl
-                            val size = UpdateCheck.sizeText(rel.sizeBytes)
-                            if (url.isBlank()) {
-                                updLine = "该版本未提供下载地址"; updFail = true
-                            } else if (UpdateCheck.open(ctx, url)) {
-                                updLine = "已在浏览器中打开 ${rel.tag}${if (size.isBlank()) "" else "（$size）"}"
-                                updFail = false
-                            } else {
-                                updLine = "没有可用的浏览器，请手动访问 ${rel.pageUrl}"; updFail = true
+                    // 已下完（校验过）还没装：再走一次安装，不重新下载。
+                    is UpdState.Ready -> st = settle(ctx, UpdateDownload.Done.Ok(s.file), s.tag)
+                    UpdState.Idle, is UpdState.Note -> {
+                        st = UpdState.Checking
+                        scope.launch {
+                            val r = withContext(Dispatchers.IO) {
+                                UpdateCheck.check(version.ifBlank { "0" })
+                            }
+                            st = when (r) {
+                                is UpdateCheck.Result.Newer -> UpdState.Found(r.release)
+                                is UpdateCheck.Result.Latest -> {
+                                    val tag = r.release?.tag.orEmpty()
+                                    UpdState.Note(
+                                        if (tag.isBlank()) "当前已是最新版本" else "当前已是最新版本（$tag）",
+                                        false,
+                                    )
+                                }
+                                is UpdateCheck.Result.Failed -> UpdState.Note("检查失败：${r.reason}", true)
                             }
                         }
-                        is UpdateCheck.Result.Latest -> {
-                            val tag = r.release?.tag.orEmpty()
-                            updLine = if (tag.isBlank()) "当前已是最新版本" else "当前已是最新版本（$tag）"
-                            updFail = false
-                        }
-                        is UpdateCheck.Result.Failed -> {
-                            updLine = "检查失败：${r.reason}"; updFail = true
-                        }
                     }
+                    // 正在检查 / 正在下载：这一行是状态显示器，不是按钮。
+                    UpdState.Checking, is UpdState.Working -> Unit
                 }
             }
-            if (updLine.isNotBlank()) {
+            val line = when (val s = st) {
+                UpdState.Idle, UpdState.Checking -> ""
+                is UpdState.Found -> {
+                    val size = UpdateCheck.sizeText(s.rel.sizeBytes)
+                    "发现新版本 ${s.rel.tag}" + (if (size.isBlank()) "" else "（$size）")
+                }
+                is UpdState.Working -> when {
+                    s.pct >= 1f -> "已下载完成，正在按发布摘要校验…"
+                    total > 0L -> "已下载 ${UpdateCheck.sizeText(got)} / ${UpdateCheck.sizeText(total)}"
+                    else -> "正在下载…"
+                }
+                is UpdState.Ready -> "已下载到本机，覆盖安装不会影响已有照片与配方"
+                is UpdState.Note -> s.line
+            }
+            if (line.isNotBlank()) {
                 Text(
-                    updLine,
-                    color = if (updFail) Dv.red else Dv.label3,
+                    line,
+                    color = if ((st as? UpdState.Note)?.fail == true) Dv.red else Dv.label3,
                     fontSize = 10.5f.sp, lineHeight = 15.sp,
                     modifier = Modifier.padding(start = 18.dp, end = 18.dp, bottom = 4.dp),
                 )
+            }
+            (st as? UpdState.Working)?.let { w ->
+                Box(
+                    Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, bottom = 8.dp)
+                        .height(2.dp).clip(RoundedCornerShape(1.dp))
+                        .background(Dv.label3.copy(alpha = 0.14f))
+                ) {
+                    Box(
+                        Modifier.fillMaxWidth(w.pct.coerceIn(0f, 1f)).fillMaxHeight()
+                            .background(if (w.pct >= 1f) Dv.green else Dv.accent)
+                    )
+                }
             }
             ActionRow("打开发布页") {
                 UpdateCheck.open(ctx, UpdateCheck.RELEASES_PAGE)
@@ -294,6 +366,56 @@ fun AboutSheet(ctx: Context, onDismiss: () -> Unit) {
     notice?.let { (title, body) ->
         NoticeSheet(title, body) { notice = null }
     }
+}
+
+/**
+ * 更新流程的状态。
+ *
+ * 只有一个状态变量：检查、发现、下载、校验、待安装、结果，同一时刻只可能处于其中一种。
+ * 界面上的行标签、说明文字、进度条全部由它导出 —— 用几个布尔量拼状态会在"下载中同时
+ * 显示检查失败"这类组合上露出马脚。
+ */
+private sealed interface UpdState {
+    object Idle : UpdState
+    object Checking : UpdState
+    data class Found(val rel: UpdateCheck.Release) : UpdState
+    /** [pct] 到 1.0 表示下载已完成，正在校验摘要。 */
+    data class Working(val pct: Float) : UpdState
+    data class Ready(val file: File, val tag: String) : UpdState
+    data class Note(val line: String, val fail: Boolean) : UpdState
+}
+
+private fun updLabel(s: UpdState): String = when (s) {
+    UpdState.Idle -> "检查更新"
+    UpdState.Checking -> "正在检查更新…"
+    is UpdState.Found -> "下载并安装更新"
+    is UpdState.Working -> when {
+        s.pct >= 1f -> "正在校验…"
+        s.pct > 0f -> "正在下载 ${(s.pct * 100).toInt()}%"
+        else -> "正在下载…"
+    }
+    is UpdState.Ready -> "安装已下载的更新"
+    is UpdState.Note -> if (s.fail) "重新检查" else "检查更新"
+}
+
+/** 下载结束后的收口：装得起来就装，装不起来给出人能照着做的下一步。 */
+private fun settle(ctx: Context, done: UpdateDownload.Done, tag: String): UpdState = when (done) {
+    is UpdateDownload.Done.Ok -> {
+        val ins = UpdateDownload.install(ctx, done.file)
+        when {
+            ins.ok -> UpdState.Note(
+                "${tag.ifBlank { "更新" }} 已下载并通过校验，已交给系统安装程序", false
+            )
+            // 缺"安装未知应用"授权：设置页已经打开，回来点"安装已下载的更新"即可，
+            // 不必重新下一遍 22 MiB。
+            !UpdateDownload.canInstall(ctx) -> UpdState.Ready(done.file, tag)
+            else -> UpdState.Note(ins.line, true)
+        }
+    }
+    is UpdateDownload.Done.Bad -> UpdState.Note(
+        "校验失败：文件与发布摘要不符，已删除（本地 ${done.actual.take(12)}…）", true
+    )
+    is UpdateDownload.Done.Fail -> UpdState.Note("下载失败：${done.reason}", true)
 }
 
 /** 构建状态徽标：一枚色点 + 标题 + 一行原因，长指纹单独一行等宽显示。 */

@@ -10,11 +10,14 @@ import java.net.URL
 import java.net.UnknownHostException
 
 /**
- * 更新检查（r61）。
+ * 更新检查（r61，r62 起带安装包摘要）。
  *
- * 只做两件事：向 GitHub 查询最新一次 Release，拿到安装包的下载直链后交给系统浏览器。
- * **不下载、不校验、不安装** —— 安装由浏览器与系统的包安装器负责。这样应用本身不需要
- * 存储权限、不需要 REQUEST_INSTALL_PACKAGES，也不必在版本迭代里维护一套下载器。
+ * 只负责"查询"：向 GitHub 取最新一次 Release，读出标签、安装包直链、体积与摘要。
+ * 下载与安装见 [UpdateDownload]；这里不碰文件、不起前台服务。
+ *
+ * 摘要取自 Release 资产的 `digest` 字段（形如 `sha256:…`）。它对**下载下来的字节**
+ * 负责，因此应用内下载可以在安装前自证拿到的是发布者上传的那一份，而不是中间被
+ * 替换、被截断的文件。字段缺失时留空，下载流程会明确提示"无法校验"。
  *
  * 版本比较只认 tag：正式标签形如 `v0.8.116-r60`。先比三段语义版本，再比构建号（`r60`）。
  * 比较不出来（标签被改成别的写法）就明确报错，不猜。
@@ -36,6 +39,8 @@ object UpdateCheck {
         val apkUrl: String?,
         val apkName: String?,
         val sizeBytes: Long,
+        /** 安装包的 SHA-256（小写十六进制），GitHub 未提供时为 null。 */
+        val apkSha256: String? = null,
     )
 
     sealed interface Result {
@@ -80,6 +85,7 @@ object UpdateCheck {
             apkUrl = apk?.optString("browser_download_url")?.takeIf { it.isNotBlank() },
             apkName = apk?.optString("name")?.takeIf { it.isNotBlank() },
             sizeBytes = apk?.optLong("size") ?: 0L,
+            apkSha256 = sha256Of(apk?.optString("digest")),
         )
 
         val diff = compareVersions(currentVersion, tag)
@@ -133,6 +139,15 @@ object UpdateCheck {
 
     private val SEMVER = Regex("""(\d+)\.(\d+)\.(\d+)""")
     private val BUILD = Regex("""(?i)r(\d+(?:\.\d+)?)""")
+
+    /** `sha256:HEX` → `HEX`。只认 sha256，其它算法留空（本应用只按 sha256 校验）。 */
+    private fun sha256Of(digest: String?): String? {
+        val d = digest?.trim().orEmpty()
+        val hex = d.substringAfter(':', d)
+        return if (d.startsWith("sha256:", true) && hex.length == 64 &&
+            hex.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+        ) hex.lowercase() else null
+    }
 
     private fun fetch(ua: String): String {
         val conn = (URL(API).openConnection() as HttpURLConnection).apply {

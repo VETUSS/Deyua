@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
+    <!-- 导出后的临时文件，供"导出并共享"使用 -->
     <cache-path name="spektra_cache" path="." />
+    <!-- [r62] 应用内下载的更新包。装完即失效，卸载随应用一并清除。
+         path 必须与 UpdateDownload.DIR 一致，否则 FileProvider 会拒绝生成 uri。 -->
+    <external-files-path name="updates" path="updates/" />
 </paths>
