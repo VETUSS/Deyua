@@ -139,14 +139,23 @@ object LiveMovie {
             val jpeg = bos.toByteArray()
             // 主图时刻取"成片已稳定显示"的那一段中间，而不是视频末尾 —— 播到 5.6 s
             // 正好是最后一帧的边界，有的解码器会取到空帧，长按播放先黑一下。
-            val tsUs = minOf(
+            val stillUs = minOf(
                 (LiveFx.STILL_AT * 1_000_000f).toInt(),
                 (seconds * 1_000_000f).toInt() - 100_000,
             ).coerceAtLeast(0)
-            val out = attachMotionPhoto(jpeg, mp4, tsUs, metaLine)
+            // ColorOS 机型走 OPPO 自己的那套布局：真机写入的主图时刻是 0（不是封面所在的
+            // 4.4 s），且不带 Google 的 MicroVideo* 三个旧标签。见 [attachMotionPhoto]。
+            val colorOs = isColorOs()
+            val tsUs = if (colorOs) 0 else stillUs
+            val out = attachMotionPhoto(jpeg, mp4, tsUs, metaLine, colorOs)
             val uri = saveImage(ctx, out, "$baseName.jpg")
                 ?: return Result(false, "写入相册失败（存储空间或权限）")
-            Diagnostics.log("live", "动态照片已保存 ${s.first}x${s.second} jpeg=${out.size} mp4=${mp4.size} $uri")
+            Diagnostics.log(
+                "live", "动态照片已保存 ${s.first}x${s.second} jpeg=${out.size} mp4=${mp4.size}" +
+                    " flavor=${if (colorOs) "coloros" else "generic"} ts=$tsUs" +
+                    (if (colorOs) " comment=$TOKEN" else "") +
+                    " segs=${segmentTable(out)} $uri"
+            )
             return Result(true, "动态照片已保存到相册", uri.toString(),
                 "${s.first}×${s.second} · ${"%.1f".format(seconds)} 秒$soundNote · ${fmtSize(out.size)}")
         } catch (e: Exception) {
@@ -517,41 +526,47 @@ object LiveMovie {
     /**
      * 在 JPEG 末尾接上 MP4，并把相册认出"这是动态照片"所需的元数据补齐。
      *
-     * 三家认的东西不一样，缺一样就只是静图：
+     * 两套布局，按机型分流（[isColorOs]）—— 没有一套能通吃：
      *
-     *  · **Google / 三星 / 小米**：XMP 里的 `GCamera:MicroVideoOffset` 与
-     *    `Container:Directory`（比例未知，两种都写才能全覆盖）。
-     *  · **OPPO / 一加 / realme（ColorOS）**：只写 XMP 一律当静图。它还要
+     *  · **generic**（Google 相册 / 三星 / 小米）：写 `GCamera:MicroVideo*` 旧标签
+     *    与 `Container:Directory`，主图时刻取成片稳定可见处。
+     *  · **coloros**（OPPO / 一加 / realme）：真机产物不写 `MicroVideo*`，两个主图
+     *    时刻字段都写 `0`，Primary 的 `Item:Length` 也写 `0`（长度靠 MPF 与
+     *    `VideoLength` 反推）。另有三个必填件：
      *    ① EXIF `UserComment` 里的暗号 `Oplus_8388608`（8 位特征位，0x800000）；
-     *    ② `OpCamera` 私有命名空间的几个字段（`MotionPhotoOwner=oplus`、
-     *       `OLivePhotoVersion=2`、`MotionPhotoFeatureFlag=1`、`VideoLength`）；
+     *    ② `OpCamera` 私有命名空间（`MotionPhotoOwner=oplus`、`OLivePhotoVersion=2`、
+     *       `MotionPhotoFeatureFlag=1`、`VideoLength`）；
      *    ③ 一个 MPF（Multi-Picture Format）APP2 段，声明"本图是 Baseline MP
-     *       Primary，共 1 张"。这三样是 OPPO 相册的判据，与视频本身无关。
+     *       Primary，共 1 张"。
+     *
+     * r65 之前只有 generic 一套，且 ColorOS 也走它：时间戳是 4.4 s、还带 MicroVideo*。
+     * 真机里这两个都是 0 / 不写，实测报"相册里仍是静图"，故分流。
      *
      * 段的顺序也照真机产物排：`APP0(JFIF) → APP1(Exif) → APP1(XMP) → APP2(MPF)`，
      * 全部插在 SOI 之后、DQT 之前。XMP 放到 EXIF 前面时，有的解析器把第一个
      * APP1 当 EXIF 读、读不出就判定"没有元数据"。
      *
-     * 长度自洽：XMP 里 Primary 的长度包含 XMP 自身，MPF 里的单图长度又等于整段
-     * JPEG 长度。所以两者都用固定 10 位宽度占位，先算一遍再回填 —— 否则会陷入
-     * "改一个字符、长度又变"的死循环。
+     * 长度自洽：generic 的 XMP 里 Primary 长度包含 XMP 自身，MPF 里的单图长度又
+     * 等于整段 JPEG 长度，所以前者用固定 10 位宽度占位、先算一遍再回填 —— 否则会
+     * 陷入"改一个字符、长度又变"的死循环。coloros 的 Primary 写 0，没有这个问题。
      */
     private fun attachMotionPhoto(
         jpeg: ByteArray, mp4: ByteArray, durationUs: Int, description: String,
+        colorOs: Boolean,
     ): ByteArray {
         val ins = appInsertionPoint(jpeg)
         val exif = exifSegment(description)
         // MPF 段的长度与内容无关（只有一个定长条目），先取一个占位版本量尺寸。
         val mpfLen = mpfSegment(0).size
 
-        var primary = jpeg.size + exif.size + mpfLen + xmpSegment(0, mp4.size, durationUs).size
-        var xmp = xmpSegment(primary, mp4.size, durationUs)
+        var primary = jpeg.size + exif.size + mpfLen + xmpSegment(0, mp4.size, durationUs, colorOs).size
+        var xmp = xmpSegment(primary, mp4.size, durationUs, colorOs)
         var mpf = mpfSegment(primary)
         var body = splice(jpeg, ins, exif, xmp, mpf)
         if (body.size != primary) {
             // 宽度固定时不会发生；真发生了就按实际长度再对齐一次。
             primary = body.size
-            xmp = xmpSegment(primary, mp4.size, durationUs)
+            xmp = xmpSegment(primary, mp4.size, durationUs, colorOs)
             mpf = mpfSegment(primary)
             body = splice(jpeg, ins, exif, xmp, mpf)
         }
@@ -560,6 +575,47 @@ object LiveMovie {
         System.arraycopy(body, 0, out, 0, body.size)
         System.arraycopy(mp4, 0, out, body.size, mp4.size)
         return out
+    }
+
+    /**
+     * 是否 ColorOS 系（OPPO / 一加 / realme）。用品牌而非型号判断：realme 的
+     * `MANUFACTURER` 是 realme、一加是 OnePlus，三家共用的相册是同一个。
+     */
+    private fun isColorOs(): Boolean {
+        val brand = (Build.BRAND + " " + Build.MANUFACTURER + " " + Build.PRODUCT).lowercase()
+        return brand.contains("oppo") || brand.contains("oneplus") ||
+            brand.contains("realme") || brand.contains("oplus")
+    }
+
+    /**
+     * 把写出来的文件头部的段列成一行，写进运行日志。
+     *
+     * 相册认不认，最终取决于"文件里到底有什么"，而这一行是唯一能随日志回传的证据：
+     * 有它就能判断导出的是 Exif+XMP+MPF 那套，还是退回了不带元数据的裸 JPEG。
+     */
+    private fun segmentTable(j: ByteArray): String {
+        if (j.size < 4 || j[0] != 0xFF.toByte() || j[1] != 0xD8.toByte()) return "?"
+        val parts = ArrayList<String>(4)
+        var i = 2
+        while (i + 3 < j.size && parts.size < 6) {
+            if (j[i] != 0xFF.toByte()) break
+            val m = j[i + 1].toInt() and 0xFF
+            if (m !in 0xE0..0xEF) break
+            val len = ((j[i + 2].toInt() and 0xFF) shl 8) or (j[i + 3].toInt() and 0xFF)
+            if (len < 2 || i + 2 + len > j.size) break
+            val name = when {
+                m == 0xE0 -> "JFIF"
+                m == 0xE1 && j.size > i + 9 &&
+                    String(j, i + 4, 4, Charsets.US_ASCII) == "Exif" -> "Exif"
+                m == 0xE1 -> "XMP"
+                m == 0xE2 && j.size > i + 7 &&
+                    String(j, i + 4, 3, Charsets.US_ASCII) == "MPF" -> "MPF"
+                else -> "APP${m - 0xE0}"
+            }
+            parts.add("$name($len)")
+            i += 2 + len
+        }
+        return parts.joinToString(",")
     }
 
     /** 插在最后一个 APPn 段之后（也就是所有 EXIF / XMP / 其它 APPn 的后面）。 */
@@ -696,20 +752,28 @@ object LiveMovie {
         b[at + 3] = (v and 0xFF).toByte()
     }
 
-    private fun xmpSegment(primaryLen: Int, videoLen: Int, durationUs: Int): ByteArray {
-        val p = primaryLen.toString().padStart(10, '0')
+    /**
+     * @param primaryLen 整段 JPEG 长度（含本段）。generic 写进去，coloros 写 `0`。
+     * @param durationUs 主图时刻。coloros 传 0（真机写法），generic 传成片稳定处。
+     */
+    private fun xmpSegment(
+        primaryLen: Int, videoLen: Int, durationUs: Int, colorOs: Boolean,
+    ): ByteArray {
         val ts = durationUs.coerceAtLeast(0)
+        // ColorOS 真机产物：没有 MicroVideo* 三个旧标签，Primary 的 Item:Length 为 0。
+        val legacy = if (colorOs) "" else """
+    GCamera:MicroVideo="1"
+    GCamera:MicroVideoVersion="1"
+    GCamera:MicroVideoOffset="$videoLen"
+    GCamera:MicroVideoPresentationTimestampUs="$ts""""
+        val p = if (colorOs) "0" else primaryLen.toString().padStart(10, '0')
         val x = """<x:xmpmeta xmlns:x="adobe:ns:meta/">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description rdf:about=""
     xmlns:GCamera="http://ns.google.com/photos/1.0/camera/"
     xmlns:OpCamera="http://ns.oplus.com/photos/1.0/camera/"
     xmlns:Container="http://ns.google.com/photos/1.0/container/"
-    xmlns:Item="http://ns.google.com/photos/1.0/container/item/"
-    GCamera:MicroVideo="1"
-    GCamera:MicroVideoVersion="1"
-    GCamera:MicroVideoOffset="$videoLen"
-    GCamera:MicroVideoPresentationTimestampUs="$ts"
+    xmlns:Item="http://ns.google.com/photos/1.0/container/item/"$legacy
     GCamera:MotionPhoto="1"
     GCamera:MotionPhotoVersion="1"
     GCamera:MotionPhotoPresentationTimestampUs="$ts"

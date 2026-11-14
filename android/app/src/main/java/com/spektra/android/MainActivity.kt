@@ -3520,13 +3520,17 @@ fun SpektraScreen(
         }
         val text = remember(eng, liveParams) {
             buildString {
+                // 顺序按"被截断时保住什么"排：用户复制出去的日志常常只有前 7000 字
+                // （聊天窗口/文档转换会切），而参数 Schema 单独就有上万字。以前它排在
+                // 运行日志前面，结果版本号、导出记录一条都传不回来 —— r64 那次就是
+                // 这样，只能看到引擎能力和一份字段表。Schema 挪到最后，切掉也无所谓。
                 append("==== 引擎能力 ====\n").append(eng?.capabilities ?: "(未创建)").append("\n\n")
                 // 空不代表出错：没导入照片（session=0）时本来就没有"当前值"。
                 // 写清楚原因，免得拿到日志的人把这一行当成渲染异常。
                 append("==== 当前片边/几何 ====\n")
                     .append(liveParams.ifEmpty { "（未打开照片：先导入一张图再看这一段）" }).append("\n\n")
-                append("==== 参数 Schema ====\n").append(eng?.paramsSchema ?: "").append("\n\n")
-                append("==== 运行日志 ====\n").append(Diagnostics.dump())
+                append("==== 运行日志 ====\n").append(Diagnostics.dump()).append("\n\n")
+                append("==== 参数 Schema ====\n").append(eng?.paramsSchema ?: "")
             }
         }
         AlertDialog(onDismissRequest = { showLog = false }, containerColor = Dv.panelRaised,
