@@ -20,10 +20,12 @@ object Diagnostics {
     private val startMs = System.currentTimeMillis()
     private var file: File? = null
     private var prevText: String = ""
+    private var appCtx: Context? = null
     private const val MAX = 800
 
     /** 必须在最早的 Activity.onCreate 调用一次。 */
     fun init(ctx: Context) {
+        appCtx = ctx.applicationContext
         val f = File(ctx.filesDir, "diagnostics.log")
         file = f
         // 上次会话(可能含崩溃前日志)原文
@@ -50,6 +52,9 @@ object Diagnostics {
 
     fun dump(): String = buildString {
         append("==== Deyva 诊断日志 ====\n")
+        // r64：补版本号。之前用户报"导出的实况图相册不认"，拿到日志却看不出装的是
+        // 哪一版 —— 没有版本号就没法判断他到底有没有跑到修复之后的那一版。
+        append("版本: ${versionLine()}\n")
         append("设备: ${Build.MANUFACTURER} ${Build.MODEL}\n")
         append("Android: API ${Build.VERSION.SDK_INT}\n")
         append("ABI: ${Build.SUPPORTED_ABIS.joinToString()}\n")
@@ -62,5 +67,13 @@ object Diagnostics {
         }
         append("【本次会话】\n")
         lines.forEach { append(it).append('\n') }
+    }
+
+    private fun versionLine(): String {
+        val c = appCtx ?: return "(未知)"
+        val pi = runCatching { c.packageManager.getPackageInfo(c.packageName, 0) }.getOrNull()
+            ?: return "(未知)"
+        val code = if (Build.VERSION.SDK_INT >= 28) pi.longVersionCode else @Suppress("DEPRECATION") pi.versionCode.toLong()
+        return "${pi.versionName} ($code)"
     }
 }

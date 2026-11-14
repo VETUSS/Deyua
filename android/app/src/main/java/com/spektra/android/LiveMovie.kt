@@ -14,7 +14,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
-import android.media.ExifInterface
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -29,10 +28,11 @@ import java.util.concurrent.TimeUnit
  *
  * 两条产物：
  *  · **MP4**：H.264，存进 `Movies/Deyva`；
- *  · **Live Photo**：一张 JPEG，尾部直接接上这段 MP4，并在 XMP 里声明
- *    `GCamera:MicroVideoOffset` 与 Google 的 `Container:Directory` 两种写法 ——
- *    小米 / OPPO / 三星 / Google 相册各自认其中一种，只写一种就会出现
- *    "在我的手机上能动、在你的手机上是静图"。
+ *  · **Live Photo**：一张 JPEG，尾部直接接上这段 MP4。各家相册认的元数据不一样：
+ *    Google 系看 `GCamera:MicroVideoOffset` 与 `Container:Directory`，小米同此；
+ *    OPPO / 一加 / realme（ColorOS）还要 EXIF `UserComment` 里的 `Oplus_8388608`
+ *    暗号、`OpCamera` 私有字段，以及一个 MPF 段 —— 缺任何一样都只显示静图。
+ *    r63 起全部补齐（r64 把暗号首字母改回大写），见 [attachMotionPhoto]。
  *
  * 画面一律由 [LiveFx] 画，和屏幕上预览用的是同一个函数：所见即所存。
  */
@@ -69,6 +69,20 @@ object LiveMovie {
     private const val MAX_VIDEO = 1440
 
     /**
+     * ColorOS（OPPO / 一加 / realme）识别动态照片的暗号：EXIF `UserComment` 里的特征位。
+     *
+     * 8388608 = 0x800000，是 OPPO 相机写入 "MOTION_PHOTO" 那一位。相册只要在
+     * UserComment 里读到它就把文件当动态照片，读不到就只显示一张静图 —— 与视频
+     * 内容、与 XMP 是否正确都无关。
+     *
+     * r64：**首字母大写 `Oplus_`**。r63 写的是小写，社区里两种大小写都有人贴、
+     * 都说"能用"，互相矛盾；唯一有真机出处的是 oppo-live-photo-maker 里那份
+     * 按 Find X7 Ultra（ColorOS 14）实拍样本逆向出来的结构，写的是大写 O，
+     * 这里跟真机对齐 —— 万一固件是逐字节比较，小写就是不认的那一种。
+     */
+    private const val TOKEN = "Oplus_8388608"
+
+    /**
      * @param livePhoto true → 存成动态照片（JPEG + MP4）；false → 存成 MP4 视频
      * @param gate 成片里门洞的位置（[LiveFx.gateFracFor]）：取景器动画只看门洞里的像，
      *   最后一帧才把带片边的那张成片整张放出来。null = 这张没开片边。
@@ -82,7 +96,6 @@ object LiveMovie {
         shouldStop: () -> Boolean = { false },
     ): Result {
         var tmp: File? = null
-        var stillTmp: File? = null
         try {
             if (photo.isRecycled) return Result(false, "底片已释放，无法导出")
 
@@ -121,20 +134,16 @@ object LiveMovie {
             val bos = ByteArrayOutputStream()
             still.compress(Bitmap.CompressFormat.JPEG, 94, bos)
             still.recycle()
-            stillTmp = File(ctx.cacheDir, "live_still_$stamp.jpg").apply { writeBytes(bos.toByteArray()) }
-            runCatching {
-                ExifInterface(stillTmp.absolutePath).apply {
-                    setAttribute(ExifInterface.TAG_SOFTWARE, "Deyva")
-                    setAttribute(ExifInterface.TAG_MODEL, "Deyva Live")
-                    setAttribute(ExifInterface.TAG_ORIENTATION, "1")
-                    setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION,
-                        metaLine.ifBlank { "Deyva live photo" })
-                }.saveAttributes()
-            }.onFailure { Diagnostics.log("live", "静帧 EXIF 写入失败：${it.message}") }
 
             val mp4 = tmp.readBytes()
-            val jpeg = stillTmp.readBytes()
-            val out = attachMotionPhoto(jpeg, mp4, (seconds * 1_000_000).toInt())
+            val jpeg = bos.toByteArray()
+            // 主图时刻取"成片已稳定显示"的那一段中间，而不是视频末尾 —— 播到 5.6 s
+            // 正好是最后一帧的边界，有的解码器会取到空帧，长按播放先黑一下。
+            val tsUs = minOf(
+                (LiveFx.STILL_AT * 1_000_000f).toInt(),
+                (seconds * 1_000_000f).toInt() - 100_000,
+            ).coerceAtLeast(0)
+            val out = attachMotionPhoto(jpeg, mp4, tsUs, metaLine)
             val uri = saveImage(ctx, out, "$baseName.jpg")
                 ?: return Result(false, "写入相册失败（存储空间或权限）")
             Diagnostics.log("live", "动态照片已保存 ${s.first}x${s.second} jpeg=${out.size} mp4=${mp4.size} $uri")
@@ -145,7 +154,6 @@ object LiveMovie {
             return Result(false, "导出失败：${e.message}")
         } finally {
             runCatching { tmp?.delete() }
-            runCatching { stillTmp?.delete() }
         }
     }
 
@@ -507,75 +515,228 @@ object LiveMovie {
 
     // ------------------------------------------------------------ 动态照片封装
     /**
-     * 在 JPEG 末尾接上 MP4，并写入两种 XMP 声明。
+     * 在 JPEG 末尾接上 MP4，并把相册认出"这是动态照片"所需的元数据补齐。
      *
-     * 数字宽度固定成 10 位：XMP 的长度会随"图像长度"这个数字的位数变化，
-     * 而图像长度又包含 XMP 本身 —— 不留固定宽度就会陷入"改一个字符、长度又变"的死循环。
+     * 三家认的东西不一样，缺一样就只是静图：
+     *
+     *  · **Google / 三星 / 小米**：XMP 里的 `GCamera:MicroVideoOffset` 与
+     *    `Container:Directory`（比例未知，两种都写才能全覆盖）。
+     *  · **OPPO / 一加 / realme（ColorOS）**：只写 XMP 一律当静图。它还要
+     *    ① EXIF `UserComment` 里的暗号 `Oplus_8388608`（8 位特征位，0x800000）；
+     *    ② `OpCamera` 私有命名空间的几个字段（`MotionPhotoOwner=oplus`、
+     *       `OLivePhotoVersion=2`、`MotionPhotoFeatureFlag=1`、`VideoLength`）；
+     *    ③ 一个 MPF（Multi-Picture Format）APP2 段，声明"本图是 Baseline MP
+     *       Primary，共 1 张"。这三样是 OPPO 相册的判据，与视频本身无关。
+     *
+     * 段的顺序也照真机产物排：`APP0(JFIF) → APP1(Exif) → APP1(XMP) → APP2(MPF)`，
+     * 全部插在 SOI 之后、DQT 之前。XMP 放到 EXIF 前面时，有的解析器把第一个
+     * APP1 当 EXIF 读、读不出就判定"没有元数据"。
+     *
+     * 长度自洽：XMP 里 Primary 的长度包含 XMP 自身，MPF 里的单图长度又等于整段
+     * JPEG 长度。所以两者都用固定 10 位宽度占位，先算一遍再回填 —— 否则会陷入
+     * "改一个字符、长度又变"的死循环。
      */
-    private fun attachMotionPhoto(jpeg: ByteArray, mp4: ByteArray, durationUs: Int): ByteArray {
-        val xmp0 = xmp(0, mp4.size, durationUs)
-        val probe = insertXmp(jpeg, xmp0)
-        var primary = probe.size
-        var xmp1 = xmp(primary, mp4.size, durationUs)
-        var body = insertXmp(jpeg, xmp1)
+    private fun attachMotionPhoto(
+        jpeg: ByteArray, mp4: ByteArray, durationUs: Int, description: String,
+    ): ByteArray {
+        val ins = appInsertionPoint(jpeg)
+        val exif = exifSegment(description)
+        // MPF 段的长度与内容无关（只有一个定长条目），先取一个占位版本量尺寸。
+        val mpfLen = mpfSegment(0).size
+
+        var primary = jpeg.size + exif.size + mpfLen + xmpSegment(0, mp4.size, durationUs).size
+        var xmp = xmpSegment(primary, mp4.size, durationUs)
+        var mpf = mpfSegment(primary)
+        var body = splice(jpeg, ins, exif, xmp, mpf)
         if (body.size != primary) {
-            // 理论上不会发生（宽度固定）；真发生了就再对齐一次
+            // 宽度固定时不会发生；真发生了就按实际长度再对齐一次。
             primary = body.size
-            xmp1 = xmp(primary, mp4.size, durationUs)
-            body = insertXmp(jpeg, xmp1)
+            xmp = xmpSegment(primary, mp4.size, durationUs)
+            mpf = mpfSegment(primary)
+            body = splice(jpeg, ins, exif, xmp, mpf)
         }
+
         val out = ByteArray(body.size + mp4.size)
         System.arraycopy(body, 0, out, 0, body.size)
         System.arraycopy(mp4, 0, out, body.size, mp4.size)
         return out
     }
 
-    private fun insertXmp(jpeg: ByteArray, xmpBytes: ByteArray): ByteArray {
-        if (jpeg.size < 2) return jpeg
-        val payload = ByteArray(29 + xmpBytes.size)
-        System.arraycopy("http://ns.adobe.com/xap/1.0/\u0000".toByteArray(Charsets.US_ASCII), 0, payload, 0, 29)
-        System.arraycopy(xmpBytes, 0, payload, 29, xmpBytes.size)
-        val total = payload.size + 2
-        val out = ByteArray(jpeg.size + 2 + total)
-        out[0] = 0xFF.toByte(); out[1] = 0xD8.toByte()
-        out[2] = 0xFF.toByte(); out[3] = 0xE1.toByte()
-        out[4] = ((total shr 8) and 0xFF).toByte(); out[5] = (total and 0xFF).toByte()
-        System.arraycopy(payload, 0, out, 6, payload.size)
-        System.arraycopy(jpeg, 2, out, 6 + payload.size, jpeg.size - 2)
+    /** 插在最后一个 APPn 段之后（也就是所有 EXIF / XMP / 其它 APPn 的后面）。 */
+    private fun appInsertionPoint(j: ByteArray): Int {
+        if (j.size < 4 || j[0] != 0xFF.toByte() || j[1] != 0xD8.toByte()) return 2
+        var i = 2
+        var last = 2
+        while (i + 3 < j.size) {
+            if (j[i] != 0xFF.toByte()) break
+            val m = j[i + 1].toInt() and 0xFF
+            if (m !in 0xE0..0xEF) break          // 不是 APPn：DQT / SOF / SOS，停
+            val len = ((j[i + 2].toInt() and 0xFF) shl 8) or (j[i + 3].toInt() and 0xFF)
+            if (len < 2 || i + 2 + len > j.size) break
+            i += 2 + len
+            last = i
+        }
+        return last
+    }
+
+    private fun splice(j: ByteArray, at: Int, vararg segs: ByteArray): ByteArray {
+        var n = j.size
+        for (s in segs) n += s.size
+        val out = ByteArray(n)
+        System.arraycopy(j, 0, out, 0, at)
+        var p = at
+        for (s in segs) {
+            System.arraycopy(s, 0, out, p, s.size)
+            p += s.size
+        }
+        System.arraycopy(j, at, out, p, j.size - at)
         return out
     }
 
-    private fun xmp(primaryLen: Int, videoLen: Int, durationUs: Int): ByteArray {
+    /**
+     * 最小可用的 EXIF 段：IFD0 只放 ImageDescription 与指向 Exif 子 IFD 的指针，
+     * 子 IFD 里只放 UserComment。
+     *
+     * 不放相机厂商、镜头、GPS —— OPPO 的判据只看 `UserComment` 里那个特征位，
+     * 而"复制整段真机 EXIF"恰恰更容易因为子 IFD 的偏移对不上而写坏（社区里踩过）。
+     * 暗号见 [TOKEN]，与真机逆向样本逐字节一致（含首字母大写）。
+     */
+    private fun exifSegment(description: String): ByteArray {
+        val desc = (description.ifBlank { "Deyva live photo" }).toByteArray(Charsets.UTF_8)
+        val pad = desc.size and 1                       // TIFF 里数据按偶数字节对齐
+        val cmt = ByteArray(8 + TOKEN.length)
+        // UserComment 以 8 字节字符集标识开头：ASCII + 三个 0。
+        System.arraycopy(
+            byteArrayOf(0x41, 0x53, 0x43, 0x49, 0x49, 0, 0, 0), 0, cmt, 0, 8
+        )
+        System.arraycopy(TOKEN.toByteArray(Charsets.US_ASCII), 0, cmt, 8, TOKEN.length)
+
+        val ifd0 = 8
+        val exifIfd = ifd0 + 2 + 2 * 12 + 4              // 38
+        val data = exifIfd + 2 + 12 + 4                  // 56
+        val cmtOff = data + desc.size + pad
+        val tiff = ByteArray(cmtOff + cmt.size)
+
+        tiff[0] = 'M'.code.toByte(); tiff[1] = 'M'.code.toByte()   // 大端
+        put16(tiff, 2, 42); put32(tiff, 4, 8)
+
+        put16(tiff, ifd0, 2)                                       // IFD0：两个条目
+        put16(tiff, ifd0 + 2, 0x010E); put16(tiff, ifd0 + 4, 2)     // ImageDescription / ASCII
+        put32(tiff, ifd0 + 6, desc.size); put32(tiff, ifd0 + 10, data)
+        put16(tiff, ifd0 + 14, 0x8769); put16(tiff, ifd0 + 16, 4)   // ExifIFDPointer / LONG
+        put32(tiff, ifd0 + 18, 1); put32(tiff, ifd0 + 22, exifIfd)
+        put32(tiff, ifd0 + 26, 0)                                  // 没有下一个 IFD
+
+        put16(tiff, exifIfd, 1)
+        put16(tiff, exifIfd + 2, 0x9286); put16(tiff, exifIfd + 4, 7)  // UserComment / UNDEFINED
+        put32(tiff, exifIfd + 6, cmt.size); put32(tiff, exifIfd + 10, cmtOff)
+        put32(tiff, exifIfd + 14, 0)
+
+        System.arraycopy(desc, 0, tiff, data, desc.size)
+        System.arraycopy(cmt, 0, tiff, cmtOff, cmt.size)
+
+        val body = ByteArray(6 + tiff.size)
+        System.arraycopy("Exif\u0000\u0000".toByteArray(Charsets.US_ASCII), 0, body, 0, 6)
+        System.arraycopy(tiff, 0, body, 6, tiff.size)
+        return jpegSegment(0xE1, body)
+    }
+
+    /**
+     * MPF（Multi-Picture Format）APP2 段：声明本 JPEG 只有一张 Baseline MP Primary 图。
+     *
+     * `imageSize` 是**不含尾部 MP4** 的整段 JPEG 长度。OPPO 相册拿这个段确认
+     * "这是一张多图文件的主图"，缺了它即使 XMP 全对也只显示静图。
+     */
+    private fun mpfSegment(imageSize: Int): ByteArray {
+        val tiff = ByteArray(8 + 2 + 3 * 12 + 4 + 16)
+        tiff[0] = 'M'.code.toByte(); tiff[1] = 'M'.code.toByte()
+        put16(tiff, 2, 42); put32(tiff, 4, 8)
+
+        val ifd = 8
+        put16(tiff, ifd, 3)
+        put16(tiff, ifd + 2, 0xB000); put16(tiff, ifd + 4, 7)       // MPFVersion / UNDEFINED
+        put32(tiff, ifd + 6, 4)                                     // "0100"
+        tiff[ifd + 10] = '0'.code.toByte(); tiff[ifd + 11] = '1'.code.toByte()
+        tiff[ifd + 12] = '0'.code.toByte(); tiff[ifd + 13] = '0'.code.toByte()
+        put16(tiff, ifd + 14, 0xB001); put16(tiff, ifd + 16, 4)      // NumberOfImages / LONG
+        put32(tiff, ifd + 18, 1); put32(tiff, ifd + 22, 1)
+        put16(tiff, ifd + 26, 0xB002); put16(tiff, ifd + 28, 7)      // MPEntry / UNDEFINED
+        put32(tiff, ifd + 30, 16); put32(tiff, ifd + 34, 50)         // 条目数据紧接 IFD
+        put32(tiff, ifd + 38, 0)                                     // 没有下一个 IFD
+
+        val e = 50
+        put32(tiff, e, 0x00030000)          // Baseline MP Primary Image / JPEG
+        put32(tiff, e + 4, imageSize)       // 单图长度
+        put32(tiff, e + 8, 0)               // 与主图的偏移（自己就是主图）
+        put16(tiff, e + 12, 0); put16(tiff, e + 14, 0)
+
+        val body = ByteArray(4 + tiff.size)
+        System.arraycopy("MPF\u0000".toByteArray(Charsets.US_ASCII), 0, body, 0, 4)
+        System.arraycopy(tiff, 0, body, 4, tiff.size)
+        return jpegSegment(0xE2, body)
+    }
+
+    private fun jpegSegment(marker: Int, body: ByteArray): ByteArray {
+        val out = ByteArray(4 + body.size)
+        out[0] = 0xFF.toByte(); out[1] = marker.toByte()
+        put16(out, 2, body.size + 2)
+        System.arraycopy(body, 0, out, 4, body.size)
+        return out
+    }
+
+    private fun put16(b: ByteArray, at: Int, v: Int) {
+        b[at] = ((v shr 8) and 0xFF).toByte()
+        b[at + 1] = (v and 0xFF).toByte()
+    }
+
+    private fun put32(b: ByteArray, at: Int, v: Int) {
+        b[at] = ((v shr 24) and 0xFF).toByte()
+        b[at + 1] = ((v shr 16) and 0xFF).toByte()
+        b[at + 2] = ((v shr 8) and 0xFF).toByte()
+        b[at + 3] = (v and 0xFF).toByte()
+    }
+
+    private fun xmpSegment(primaryLen: Int, videoLen: Int, durationUs: Int): ByteArray {
         val p = primaryLen.toString().padStart(10, '0')
-        val v = videoLen.toString().padStart(10, '0')
-        val d = durationUs.coerceAtLeast(0).toString().padStart(10, '0')
+        val ts = durationUs.coerceAtLeast(0)
         val x = """<x:xmpmeta xmlns:x="adobe:ns:meta/">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description rdf:about=""
     xmlns:GCamera="http://ns.google.com/photos/1.0/camera/"
+    xmlns:OpCamera="http://ns.oplus.com/photos/1.0/camera/"
     xmlns:Container="http://ns.google.com/photos/1.0/container/"
     xmlns:Item="http://ns.google.com/photos/1.0/container/item/"
     GCamera:MicroVideo="1"
     GCamera:MicroVideoVersion="1"
-    GCamera:MicroVideoOffset="$v"
-    GCamera:MicroVideoPresentationTimestampUs="$d"
+    GCamera:MicroVideoOffset="$videoLen"
+    GCamera:MicroVideoPresentationTimestampUs="$ts"
     GCamera:MotionPhoto="1"
     GCamera:MotionPhotoVersion="1"
-    GCamera:MotionPhotoPresentationTimestampUs="$d">
+    GCamera:MotionPhotoPresentationTimestampUs="$ts"
+    OpCamera:MotionPhotoOwner="oplus"
+    OpCamera:OLivePhotoVersion="2"
+    OpCamera:MotionPhotoFeatureFlag="1"
+    OpCamera:MotionPhotoPrimaryPresentationTimestampUs="$ts"
+    OpCamera:VideoLength="$videoLen">
    <Container:Directory>
     <rdf:Seq>
      <rdf:li rdf:parseType="Resource">
       <Container:Item Item:Mime="image/jpeg" Item:Semantic="Primary" Item:Length="$p" Item:Padding="0"/>
      </rdf:li>
      <rdf:li rdf:parseType="Resource">
-      <Container:Item Item:Mime="video/mp4" Item:Semantic="MotionPhoto" Item:Length="$v" Item:Padding="0"/>
+      <Container:Item Item:Mime="video/mp4" Item:Semantic="MotionPhoto" Item:Length="$videoLen" Item:Padding="0"/>
      </rdf:li>
     </rdf:Seq>
    </Container:Directory>
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>"""
-        return x.toByteArray(Charsets.UTF_8)
+        val body = ByteArray(29 + x.toByteArray(Charsets.UTF_8).size)
+        System.arraycopy(
+            "http://ns.adobe.com/xap/1.0/\u0000".toByteArray(Charsets.US_ASCII), 0, body, 0, 29
+        )
+        System.arraycopy(x.toByteArray(Charsets.UTF_8), 0, body, 29, x.toByteArray(Charsets.UTF_8).size)
+        return jpegSegment(0xE1, body)
     }
 
     // ------------------------------------------------------------ 落相册

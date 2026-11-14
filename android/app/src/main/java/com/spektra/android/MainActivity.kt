@@ -3521,7 +3521,10 @@ fun SpektraScreen(
         val text = remember(eng, liveParams) {
             buildString {
                 append("==== 引擎能力 ====\n").append(eng?.capabilities ?: "(未创建)").append("\n\n")
-                append("==== 当前片边/几何 ====\n").append(liveParams.ifEmpty { "(未就绪)" }).append("\n\n")
+                // 空不代表出错：没导入照片（session=0）时本来就没有"当前值"。
+                // 写清楚原因，免得拿到日志的人把这一行当成渲染异常。
+                append("==== 当前片边/几何 ====\n")
+                    .append(liveParams.ifEmpty { "（未打开照片：先导入一张图再看这一段）" }).append("\n\n")
                 append("==== 参数 Schema ====\n").append(eng?.paramsSchema ?: "").append("\n\n")
                 append("==== 运行日志 ====\n").append(Diagnostics.dump())
             }
