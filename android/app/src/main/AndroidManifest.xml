@@ -4,6 +4,10 @@
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+    <!-- [r68] 机内相机。取景、对焦、拍照都在应用内完成，不跳系统相机。
+         required=false：没有摄像头的设备（少数平板）照样能装，只是入口会提示不可用。 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <!-- 刻度条跨刻度触觉震动（无此权限 vibrate() 会抛 SecurityException 闪退） -->
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- 检查更新：读取 GitHub Release 的 JSON 并下载安装包 -->

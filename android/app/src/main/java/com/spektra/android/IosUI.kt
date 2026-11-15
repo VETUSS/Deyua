@@ -148,6 +148,10 @@ enum class Glyph {
     Undo, More, Copy, Plus, Grid, Pulse, Close, Document,
     // [r50] 已导出胶片列表 / 取景器 / 观片台 / 播放 / 视频 / 动态照片 / 展开箭头
     Roll, Frame, Lamp, Play, Video, Live, Chevron,
+    // [r68] 拍照入口 / 取景器内的闪光灯与切换镜头
+    Camera, Flash, Flip,
+    // [r69] 定时器 / 调整面板 / 滤镜面板 / AE-AF 锁
+    Timer, Sliders, Filters, Lock,
 }
 
 @Composable
@@ -369,6 +373,103 @@ fun GlyphIcon(
                 drawCircle(tint, radius = s * 0.30f, center = c, style = Stroke(width = stroke * 0.9f))
                 drawCircle(tint, radius = s * 0.17f, center = c, style = Stroke(width = stroke * 0.9f))
                 drawCircle(tint, radius = s * 0.055f, center = c)
+            }
+            // [r68] 相机：机身 + 取景窗 + 顶部小凸起（比"一个大圆圈"更像相机）
+            Glyph.Camera -> {
+                val w = s * 0.62f
+                val h = s * 0.44f
+                val l = c.x - w / 2f
+                val tp = c.y - h / 2f + s * 0.03f
+                drawRoundRect(color = tint, topLeft = Offset(l, tp), size = Size(w, h),
+                    cornerRadius = CornerRadius(s * 0.09f), style = Stroke(width = stroke * 0.95f))
+                // 顶部取景器凸起：只画上沿与两肩
+                val tw = w * 0.30f
+                val th = s * 0.09f
+                drawPath(Path().apply {
+                    moveTo(c.x - tw / 2f, tp)
+                    lineTo(c.x - tw / 2f, tp - th)
+                    lineTo(c.x + tw / 2f, tp - th)
+                    lineTo(c.x + tw / 2f, tp)
+                }, tint, style = Stroke(width = stroke * 0.85f, join = StrokeJoin.Round))
+                drawCircle(tint, radius = h * 0.29f, center = Offset(c.x, tp + h * 0.52f),
+                    style = Stroke(width = stroke * 0.9f))
+            }
+            // [r68] 闪光灯：一道折线闪电
+            Glyph.Flash -> {
+                val h = s * 0.30f
+                drawPath(Path().apply {
+                    moveTo(c.x + s * 0.06f, c.y - h)
+                    lineTo(c.x - s * 0.10f, c.y + s * 0.02f)
+                    lineTo(c.x + s * 0.01f, c.y + s * 0.02f)
+                    lineTo(c.x - s * 0.06f, c.y + h)
+                    lineTo(c.x + s * 0.11f, c.y - s * 0.03f)
+                    lineTo(c.x, c.y - s * 0.03f)
+                    close()
+                }, tint, style = Stroke(width = stroke * 0.85f, join = StrokeJoin.Round))
+            }
+            // [r68] 切换镜头：一个环形箭头（回转语义，与"前后摄互换"一致）
+            Glyph.Flip -> {
+                val r = s * 0.27f
+                drawArc(color = tint, startAngle = -60f, sweepAngle = 250f, useCenter = false,
+                    style = Stroke(width = stroke * 0.95f, cap = StrokeCap.Round),
+                    topLeft = Offset(c.x - r, c.y - r), size = Size(r * 2f, r * 2f))
+                val a = Math.toRadians(-60.0)
+                val p = Offset(c.x + (r * kotlin.math.cos(a)).toFloat(), c.y + (r * kotlin.math.sin(a)).toFloat())
+                val d = s * 0.11f
+                drawPath(Path().apply {
+                    moveTo(p.x + d, p.y - d * 0.2f)
+                    lineTo(p.x - d * 0.35f, p.y - d * 0.55f)
+                    lineTo(p.x - d * 0.1f, p.y + d * 0.75f)
+                    close()
+                }, tint)
+            }
+            // [r69] 定时器：一个钟面 + 两根指针
+            Glyph.Timer -> {
+                val r = s * 0.28f
+                drawCircle(tint, radius = r, center = c, style = Stroke(width = stroke * 0.95f))
+                drawLine(tint, Offset(c.x, c.y - r * 0.62f), Offset(c.x, c.y),
+                    strokeWidth = stroke * 0.9f, cap = StrokeCap.Round)
+                drawLine(tint, Offset(c.x, c.y), Offset(c.x + r * 0.48f, c.y + r * 0.18f),
+                    strokeWidth = stroke * 0.9f, cap = StrokeCap.Round)
+            }
+            // [r69] 调整：三条滑轨，每条上一个小圆点（"可调"最直白的符号）
+            Glyph.Sliders -> {
+                val w = s * 0.34f
+                val ys = listOf(-0.19f, 0f, 0.19f)
+                val knobs = listOf(0.42f, -0.5f, 0.16f)
+                ys.forEachIndexed { i, k ->
+                    val y = c.y + s * k
+                    drawLine(tint, Offset(c.x - w, y), Offset(c.x + w, y),
+                        strokeWidth = stroke * 0.85f, cap = StrokeCap.Round)
+                    drawCircle(tint, radius = s * 0.062f, center = Offset(c.x + w * knobs[i], y))
+                }
+            }
+            // [r69] 滤镜：三枚交叠的圆（彩色滤镜转盘的语汇）
+            Glyph.Filters -> {
+                val r = s * 0.19f
+                val d = s * 0.155f
+                drawCircle(tint, radius = r, center = Offset(c.x - d, c.y - d * 0.55f),
+                    style = Stroke(width = stroke * 0.85f))
+                drawCircle(tint, radius = r, center = Offset(c.x + d, c.y - d * 0.55f),
+                    style = Stroke(width = stroke * 0.85f))
+                drawCircle(tint, radius = r, center = Offset(c.x, c.y + d * 0.75f),
+                    style = Stroke(width = stroke * 0.85f))
+            }
+            // [r69] 锁定：一把锁（AE/AF 已经锁住）
+            Glyph.Lock -> {
+                val w = s * 0.24f
+                val h = s * 0.19f
+                val top = c.y - s * 0.02f
+                drawRoundRect(
+                    color = tint, topLeft = Offset(c.x - w, top), size = Size(w * 2f, h * 2f),
+                    cornerRadius = CornerRadius(s * 0.06f), style = Stroke(width = stroke * 0.9f),
+                )
+                drawArc(
+                    color = tint, startAngle = 180f, sweepAngle = 180f, useCenter = false,
+                    style = Stroke(width = stroke * 0.9f, cap = StrokeCap.Round),
+                    topLeft = Offset(c.x - w * 0.62f, top - w * 0.72f),
+                    size = Size(w * 1.24f, w * 1.24f),
+                )
             }
             Glyph.Chevron -> {
                 val w = s * 0.14f

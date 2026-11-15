@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.sp
  */
 @Composable
 fun TopBar(
+    onCamera: () -> Unit,
     onPickPhoto: () -> Unit,
     onPickFile: () -> Unit,
     onGallery: () -> Unit,
@@ -53,6 +54,10 @@ fun TopBar(
                 fontWeight = FontWeight.Medium)
         }
         Spacer(Modifier.weight(1f))
+        // [r68] 拍照：从"导入"分出来的另一半 —— 一个是已有的照片，一个是现在要拍的照片。
+        // 给它一圈极淡的琥珀底，让它在四个图标里能被一眼认出来（这是新增的主入口）。
+        DvIconButton(Glyph.Camera, "拍照", onCamera, tint = Dv.accent,
+            glyphSize = 22.dp, bg = Dv.accentDim)
         DvIconButton(Glyph.Plus, "导入照片", onPickPhoto, tint = Dv.accent, glyphSize = 23.dp)
         // 相册看不到 RAW 的机型上，这个入口是唯一能导入原始文件的路
         DvIconButton(Glyph.Document, "导入文件", onPickFile, tint = Dv.label1, glyphSize = 21.dp)

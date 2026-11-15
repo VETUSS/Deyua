@@ -91,7 +91,7 @@ import kotlinx.coroutines.withContext
 // 之后每一次渲染都排在它后面等，界面就只剩一个转圈 —— 这就是用户说的
 // "必须退出软件重进"。换成可替换的锁之后，超时可以换一把新锁并重建引擎，
 // 卡死的那根线程只会烂在它自己那把旧锁上，不再连累后续渲染。
-@Volatile private var renderGate = java.util.concurrent.locks.ReentrantLock()
+@Volatile internal var renderGate = java.util.concurrent.locks.ReentrantLock()
 // 主渲染优先标志：主渲染进行/等待时缩略图让位，避免缩略图占锁饿死主渲染(25s超时)
 @Volatile private var mainRenderPending = false
 // [r9] 上面这个标志什么时候被置起来的。原来看见 true 就永久让位 —— 一旦某次主渲染
@@ -114,7 +114,7 @@ import kotlinx.coroutines.withContext
 // 导出更是在裸线程里直接拿主会话渲染 —— 任何一条与渲染线程撞上，就是在同一个池上
 // 一边分配一边提交命令。症状恰好是日志里那个样子：**同一组参数这次出图、下次卡死 25 秒**，
 // 重建引擎后又能出图（新 device 新池）。所以这里把所有引擎调用都收进闸门。
-private fun <T> withEngineGate(timeoutMs: Long, what: String, block: () -> T): T? {
+internal fun <T> withEngineGate(timeoutMs: Long, what: String, block: () -> T): T? {
     val gate = renderGate
     val ok = try {
         gate.tryLock(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
@@ -446,6 +446,8 @@ fun SpektraScreen(
     var tab by remember { mutableIntStateOf(0) }
     var showLog by remember { mutableStateOf(false) }
     var showGallery by remember { mutableStateOf(false) }
+    // [r68] 机内相机：铺满的普通 Composable，和相册同一层，返回逐级退
+    var showCamera by remember { mutableStateOf(false) }
     // [r50] 已导出胶片：底部状态栏的片条按钮打开；live 页叠在它上面（同一个窗口，返回逐级）
     var showExports by remember { mutableStateOf(false) }
     var livePair by remember { mutableStateOf<Pair<ExportRecord, Int>?>(null) }
@@ -2195,6 +2197,7 @@ fun SpektraScreen(
 
             Column(Modifier.fillMaxSize()) {
                 TopBar(
+                    onCamera = { showCamera = true },
                     onPickPhoto = onPickPhoto,
                     onPickFile = onPickFile,
                     onGallery = { showGallery = true },
@@ -3583,6 +3586,25 @@ fun SpektraScreen(
     livePair?.let { (rec, st) ->
         LiveStudioPage(rec, st, onBack = { livePair = null })
     }
+
+    // [r68] 机内相机。拍完选中的那张直接塞进 pendingImport —— 和"导入照片"走
+    // 完全同一条解码/冲洗链路，相机这一层不需要知道任何关于引擎的事。
+    if (showCamera) CameraScreen(
+        engine = engine,
+        film = filmVariant,
+        print = printVariant,
+        // 换胶片时**不**让主界面重渲：相机占着 GPU，这时候再排一帧 1600 长边的冲洗
+        // 是白烧电——那张图在相机底下根本看不到。退出时补一次 renderTick 让编辑页跟上。
+        onFilmChange = { filmVariant = it },
+        // 相纸同理：相机里换相纸只影响取景器的查找表，不改主界面已渲染的成片
+        onPrintChange = { printVariant = it },
+        // 不再多打一次 renderTick：紧接着的导入本来就会按新胶片重冲洗一遍
+        onUse = { uri ->
+            showCamera = false
+            pendingImport.value = uri
+        },
+        onClose = { showCamera = false; renderTick++ },
+    )
 
     if (showGallery) GalleryPage(
         onClose = { showGallery = false },
