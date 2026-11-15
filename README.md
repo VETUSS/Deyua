@@ -11,13 +11,13 @@ Android 端的胶片模拟冲洗应用。导入一张照片，选择胶片与相
 
 安装包发布在 [Releases](https://github.com/VETUSS/Deyua/releases) 页面。最新版本：
 
-**[Deyva v0.8.125-r69](https://github.com/VETUSS/Deyua/releases/download/v0.8.125-r69/Deyva-v0.8.125-r69.apk)** ·
-23,231,245 字节 · Android 7.0+ · arm64-v8a · `com.spektra.android`
+**[Deyva v0.8.123-r67](https://github.com/VETUSS/Deyua/releases/download/v0.8.123-r67/Deyva-v0.8.123-r67.apk)** ·
+23,112,461 字节 · Android 7.0+ · arm64-v8a · `com.spektra.android`
 
 侧载安装，需允许「安装未知来源应用」。下载后可核对完整性：
 
 ```
-SHA-256  38ad3dc33c1fc511bd07044b9dab3d39e0e3441ab777f253dee2a03295985cf6
+SHA-256  512a206b76df4f0bd79f506b98ff167db42b3b31fcf4f9275cbd6dce1da33872
 ```
 
 从 r32 升级可直接覆盖安装（签名未变）；r29 及更早的包需要先卸载。
@@ -111,29 +111,6 @@ tools/                        打包脚本
 `android/app/src/main/jniLibs/<abi>/`，由 `CMakeLists.txt` 作为 imported target 链接。
 若修改了 `upstream/engine/src`，需要按 `upstream/engine/build-*.sh` 重新构建该
 `.so` 并替换。
-
-## 机内相机
-
-主界面顶栏「拍照」进入，不跳系统相机：自己开 Camera2、自己画取景器，拍下来直接进冲洗台。
-
-**取景器里看到的就是这卷胶片。** 逐帧调引擎做不到（一帧几十到上百毫秒），所以引擎只负责
-在换胶片/改参数时把一个 33³ 的色立方烘成查找表（约 60–120 ms，之后读缓存），取景器
-每帧只做"查表 + 加质感"，帧率与引擎无关。光晕、眩光、颗粒、暗角是**空间相关**的，
-塞不进色立方，由着色器按同一套参数近似——取景器是"方向/影调/色彩都对、质感近似"的预览，
-成片仍由主引擎精修。
-
-- **多镜头**：按 `SENSOR_INFO_PHYSICAL_SIZE` 把物理焦距换算成 35 mm 等效焦距，再按
-  比值生成 0.5× / 1× / 3× 档位。物理子相机能直开就直开（画质最好），不允许直开时
-  退回逻辑相机 + `CONTROL_ZOOM_RATIO`（没有该 API 则裁切传感器区域）。
-- **可拍的都来自系统能力位**：比例、像素都从 `SCALER_STREAM_CONFIGURATION_MAP` 的真实
-  出图尺寸里选；EV 范围读 `CONTROL_AE_COMPENSATION_RANGE`（按步长换算成 EV 显示）；
-  闪光灯/对焦区域/常亮都先查能力再下发。
-- **落盘**：默认写系统相册 `DCIM/Deyva`（MediaStore，`IS_PENDING` 收尾），可关掉只留
-  应用内；格式支持 JPEG / HEIF（HEIF 转码前按 EXIF 把位图转正）。
-- **冲洗参数**：增感/减感、密度曲线、CC 品红/黄 滤片 —— 这四项都进引擎，改完取景器里
-  就是成片的样子，不是给画面刷一层假滤镜。
-- **取景方向**：自动档会扣掉 HAL 在纹理变换矩阵里已经转过的角度；若某台机器仍不对，
-  「设置 → 取景方向」可手动定档（0/90/180/270）并记住。
 
 ## 导出与元数据
 
