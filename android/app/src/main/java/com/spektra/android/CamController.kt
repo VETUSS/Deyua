@@ -407,7 +407,10 @@ class CamController(ctx: Context) {
     }
 
     private fun applyZoom(b: CaptureRequest.Builder) {
-        val total = zoom * resolvedZoom
+        // 直开物理镜头时 resolvedZoom=1；退回逻辑相机时它是"这颗镜头相对主摄的倍率"，
+        // 用户再捏合就是两者相乘 —— 必须夹在 HAL 声明的范围内，否则 set 会抛异常被吞掉，
+        // 表现是"变焦键按了没反应"。
+        val total = (zoom * resolvedZoom).coerceIn(1f, maxZoom)
         if (Build.VERSION.SDK_INT >= 30 && zoomRatioSupported) {
             runCatching { b.set(CaptureRequest.CONTROL_ZOOM_RATIO, total.coerceAtLeast(1f)) }
             // 设了 ratio 就别同时设 crop region：两者一起给时行为由 HAL 决定，容易互相打脸
